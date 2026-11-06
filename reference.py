@@ -13,8 +13,8 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+def parse_args(argv=None, *, description=__doc__):
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct",
                         help="Hugging Face model ID or local checkpoint directory")
     parser.add_argument("--prompt", default="Explain a KV cache in one sentence.")
