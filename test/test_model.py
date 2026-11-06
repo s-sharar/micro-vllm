@@ -9,8 +9,8 @@ import unittest
 import torch
 from transformers import AutoModelForCausalLM, Qwen2Config, Qwen2ForCausalLM
 
-if importlib.util.find_spec('model') is not None:
-    import model
+if importlib.util.find_spec('micro_vllm.model') is not None:
+    from micro_vllm import model
 else:
     model = None
 

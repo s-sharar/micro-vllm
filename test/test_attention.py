@@ -7,7 +7,7 @@ import torch
 from transformers import AutoModelForCausalLM, Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Attention, eager_attention_forward
 
-import model
+from micro_vllm import model
 
 
 def reference_mask(tokens, dtype):

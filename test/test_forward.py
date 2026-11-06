@@ -7,7 +7,7 @@ import unittest
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, Qwen2Config, Qwen2ForCausalLM
 
-import model
+from micro_vllm import model
 
 
 def tiny_config(**updates):

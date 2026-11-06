@@ -2,7 +2,8 @@
 
 Run in WSL:
     source .venv/bin/activate
-    python decode.py --prompt "Explain a KV cache in one sentence."
+    python -m pip install -e .
+    python -m micro_vllm.decode --prompt "Explain a KV cache in one sentence."
 
 Single request, no padding or sampling. The model must be in evaluation mode.
 The transformer and cache are still Hugging Face implementations.
@@ -10,7 +11,7 @@ The transformer and cache are still Hugging Face implementations.
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from reference import parse_args
+from .reference import parse_args
 
 
 @torch.inference_mode()

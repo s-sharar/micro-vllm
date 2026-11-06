@@ -9,7 +9,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2RotaryEmbedding, apply_rotary_pos_emb,
 )
 
-import model
+from micro_vllm import model
 
 
 class RoPETests(unittest.TestCase):
