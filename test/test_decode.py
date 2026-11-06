@@ -20,11 +20,11 @@ from transformers import (
     PreTrainedTokenizerFast, Qwen2Config, Qwen2ForCausalLM,
 )
 
-import reference
+from micro_vllm import reference
 
-ROOT = Path(__file__).resolve().parent
-if importlib.util.find_spec("decode") is not None:
-    import decode
+ROOT = Path(__file__).resolve().parents[1] / 'src' / 'micro_vllm'
+if importlib.util.find_spec("micro_vllm.decode") is not None:
+    from micro_vllm import decode
 
 
 class DecodeTests(unittest.TestCase):
@@ -191,7 +191,7 @@ class DecodeTests(unittest.TestCase):
         self.assertIn("Response:", output.getvalue())
 
     def test_cli_end_to_end_offline(self):
-        command = [sys.executable, str(ROOT / "decode.py"), "--model",
+        command = [sys.executable, '-m', 'micro_vllm.decode', "--model",
                    str(self.checkpoint), "--device", "cpu", "--prompt", "hello",
                    "--max-new-tokens", "3"]
         result = subprocess.run(
@@ -211,7 +211,7 @@ class DecodeTests(unittest.TestCase):
         self.assertIn("Manual greedy", output.getvalue())
 
     def test_missing_cuda_exits_before_loading_model(self):
-        with patch("decode.torch.cuda.is_available", return_value=False):
+        with patch("micro_vllm.decode.torch.cuda.is_available", return_value=False):
             with self.assertRaisesRegex(SystemExit, "--device cpu"):
                 decode.main(["--device", "cuda"])
 

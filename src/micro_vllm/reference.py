@@ -2,7 +2,8 @@
 
 Run in WSL:
     source .venv/bin/activate
-    python reference.py --prompt "Explain a KV cache in one sentence."
+    python -m pip install -e .
+    python -m micro_vllm.reference --prompt "Explain a KV cache in one sentence."
 
 The first run downloads Qwen/Qwen2.5-0.5B-Instruct into Hugging Face's cache.
 This is a correctness reference, not a performance benchmark.

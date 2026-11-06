@@ -7,7 +7,7 @@ import torch
 from transformers import AutoModelForCausalLM, Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer, Qwen2RotaryEmbedding
 
-import model
+from micro_vllm import model
 
 
 def controlled_weights():

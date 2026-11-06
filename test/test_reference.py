@@ -15,7 +15,7 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import GenerationConfig, PreTrainedTokenizerFast, Qwen2Config, Qwen2ForCausalLM
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1] / 'src' / 'micro_vllm'
 
 
 class ReferenceTests(unittest.TestCase):
@@ -23,7 +23,7 @@ class ReferenceTests(unittest.TestCase):
     def setUpClass(cls):
         if not (ROOT / "reference.py").exists():
             return
-        import reference
+        from micro_vllm import reference
         cls.reference = reference
         torch.manual_seed(7)
         backend = Tokenizer(WordLevel(
@@ -102,13 +102,13 @@ class ReferenceTests(unittest.TestCase):
         self.assertIn("Response:", output.getvalue())
 
     def test_cuda_unavailable_has_actionable_error(self):
-        with patch("reference.torch.cuda.is_available", return_value=False):
+        with patch("micro_vllm.reference.torch.cuda.is_available", return_value=False):
             with self.assertRaisesRegex(SystemExit, "--device cpu"):
                 self.reference.main(["--device", "cuda"])
 
     def test_cli_end_to_end_offline(self):
         result = subprocess.run(
-            [sys.executable, str(ROOT / "reference.py"), "--model",
+            [sys.executable, '-m', 'micro_vllm.reference', "--model",
              str(self.checkpoint), "--device", "cpu", "--prompt", "hello",
              "--max-new-tokens", "2"],
             text=True, capture_output=True, timeout=60,
@@ -127,7 +127,7 @@ class ReferenceTests(unittest.TestCase):
         configured.save_pretrained(checkpoint)
         self.tokenizer.save_pretrained(checkpoint)
         result = subprocess.run(
-            [sys.executable, str(ROOT / "reference.py"), "--model",
+            [sys.executable, '-m', 'micro_vllm.reference', "--model",
              str(checkpoint), "--device", "cpu", "--prompt", "hello world",
              "--max-new-tokens", "3"],
             text=True, capture_output=True, timeout=60,
