@@ -36,7 +36,7 @@ def _greedy_decode(model, inputs, max_new_tokens):
     attention_mask = inputs["attention_mask"]
     cache_position = torch.arange(input_ids.shape[1], device=input_ids.device)
     past_key_values = None  # Every request starts with a fresh cache.
-    generated = ()
+    generated = []
     eos = model.generation_config.eos_token_id
     if isinstance(eos, int):
         eos = (eos,)
@@ -51,7 +51,7 @@ def _greedy_decode(model, inputs, max_new_tokens):
         )
         # [1, vocabulary] -> [1, 1]. No sampling or logits transformations.
         next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        generated = (*generated, next_token)
+        generated.append(next_token)
 
         # Include EOS in the result, but never run another forward after stopping.
         if step + 1 == max_new_tokens or (eos_ids and next_token.item() in eos_ids):

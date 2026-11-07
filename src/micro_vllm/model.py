@@ -5,6 +5,9 @@ import math
 import torch
 import torch.nn.functional as F
 
+from .attention import causal_attention
+from .kv_cache import ContiguousKVCache
+
 
 def embed_tokens(input_ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """Look up pretrained vectors without changing or reinitializing the table.
@@ -120,39 +123,6 @@ def apply_rope(
     rotated_key = key * head_cos + rotate_half(key) * head_sin
     return rotated_query, rotated_key
 
-def causal_attention(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-) -> torch.Tensor:
-    """Compute uncached, unpadded causal attention with grouped KV heads.
-
-    Q is [batch, query_heads, tokens, head_dim]; K/V are
-    [batch, kv_heads, tokens, head_dim]. All inputs share dtype and device.
-    Returns [batch, query_heads, tokens, head_dim], before output projection.
-    This version requires equally long full sequences and applies no dropout.
-    """
-    if query.ndim != 4 or key.ndim != 4 or key.shape != value.shape:
-        raise ValueError('Q, K, V must be rank four and K/V must have matching shapes')
-    if min(query.shape) <= 0 or min(key.shape) <= 0:
-        raise ValueError('attention dimensions must be positive')
-    batch_size, query_heads, tokens, head_dim = query.shape
-    if (key.shape[0], key.shape[2], key.shape[3]) != (batch_size, tokens, head_dim):
-        raise ValueError('Q, K, V must share batch size, token count, and head dimension')
-    if query_heads % key.shape[1]:
-        raise ValueError('query head count must be divisible by KV head count')
-    if (not query.is_floating_point() or not query.dtype == key.dtype == value.dtype
-            or not query.device == key.device == value.device):
-        raise ValueError('Q, K, V must share a floating-point dtype and device')
-
-    groups = query_heads // key.shape[1]
-    repeated_key = key.repeat_interleave(groups, dim=1)
-    repeated_value = value.repeat_interleave(groups, dim=1)
-    scores = torch.matmul(query, repeated_key.transpose(-2, -1)) * head_dim ** -0.5
-    future_mask = torch.ones(tokens, tokens, dtype=torch.bool, device=query.device).triu(1)
-    masked_scores = scores.masked_fill(future_mask, float('-inf'))
-    weights = F.softmax(masked_scores, dim=-1, dtype=torch.float32).to(query.dtype)
-    return torch.matmul(weights, repeated_value)
 
 def merge_heads(heads: torch.Tensor) -> torch.Tensor:
     """Concatenate head results per token: [batch, heads, tokens, dim] to [batch, tokens, heads * dim].
@@ -193,6 +163,39 @@ def mlp(
     gated = F.silu(gate) * up
     return F.linear(gated, down_weight)
 
+def _layer_attention(
+    normalized, weights, cos, sin, *, num_attention_heads,
+    num_key_value_heads, cache, layer_idx, attention_mask,
+):
+    """Compute this layer's attention, appending only newly computed rotated K/V."""
+    past = 0
+    if cache is not None:
+        if not isinstance(cache, ContiguousKVCache) or layer_idx is None:
+            raise ValueError('cached layers require a cache and layer index')
+        past = cache.length(layer_idx)
+    tokens = normalized.shape[1]
+    if attention_mask is not None and (
+            not isinstance(attention_mask, torch.Tensor)
+            or attention_mask.layout != torch.strided or attention_mask.dtype != torch.bool
+            or attention_mask.device != normalized.device
+            or attention_mask.shape != (tokens, past + tokens)):
+        raise ValueError('attention_mask must be a boolean [new_tokens, total_tokens] tensor')
+    query, key, value = project_qkv(
+        normalized, weights['self_attn.q_proj.weight'], weights['self_attn.k_proj.weight'],
+        weights['self_attn.v_proj.weight'], weights['self_attn.q_proj.bias'],
+        weights['self_attn.k_proj.bias'], weights['self_attn.v_proj.bias'])
+    head_dim = normalized.shape[-1] // num_attention_heads
+    query = split_heads(query, num_attention_heads, head_dim)
+    key = split_heads(key, num_key_value_heads, head_dim)
+    value = split_heads(value, num_key_value_heads, head_dim)
+    query, key = apply_rope(query, key, cos, sin)
+    if cache is not None:
+        cache.append(layer_idx, key, value)
+        key, value = cache.read(layer_idx)
+    heads = causal_attention(query, key, value, past_length=past, attention_mask=attention_mask)
+    return attention_output(heads, weights['self_attn.o_proj.weight'])
+
+
 def decoder_layer(
     hidden_states: torch.Tensor,
     weights: Mapping[str, torch.Tensor],
@@ -202,13 +205,11 @@ def decoder_layer(
     num_attention_heads: int,
     num_key_value_heads: int,
     eps: float,
+    cache: ContiguousKVCache | None = None,
+    layer_idx: int | None = None,
+    attention_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run one uncached, unpadded Qwen pre-norm layer using supplied tensors.
-
-    weights uses local layer keys, e.g. self_attn.q_proj.weight, as in a layer
-    state_dict. Cos/sin are precomputed for the sequence and shared by layers.
-    Input/output shape is [batch, tokens, hidden_size]. Inputs are unchanged.
-    """
+    """Run one unpadded Qwen pre-norm layer, optionally extending its KV cache."""
     if num_attention_heads <= 0 or num_key_value_heads <= 0:
         raise ValueError('head counts must be positive')
     if hidden_states.ndim != 3 or hidden_states.shape[-1] % num_attention_heads:
@@ -220,23 +221,18 @@ def decoder_layer(
             or cos.shape[0] not in (1, hidden_states.shape[0])
             or cos.shape[1:] != (hidden_states.shape[1], head_dim)):
         raise ValueError('RoPE tables must match the batch, token count, and head dimension')
-
     normalized = rms_norm(hidden_states, weights['input_layernorm.weight'], eps)
-    query, key, value = project_qkv(
-        normalized,
-        weights['self_attn.q_proj.weight'], weights['self_attn.k_proj.weight'],
-        weights['self_attn.v_proj.weight'], weights['self_attn.q_proj.bias'],
-        weights['self_attn.k_proj.bias'], weights['self_attn.v_proj.bias'])
-    query = split_heads(query, num_attention_heads, head_dim)
-    key = split_heads(key, num_key_value_heads, head_dim)
-    value = split_heads(value, num_key_value_heads, head_dim)
-    query, key = apply_rope(query, key, cos, sin)
-    heads = causal_attention(query, key, value)
-    after_attention = hidden_states + attention_output(heads, weights['self_attn.o_proj.weight'])
+    attention_update = _layer_attention(
+        normalized, weights, cos, sin, num_attention_heads=num_attention_heads,
+        num_key_value_heads=num_key_value_heads, cache=cache,
+        layer_idx=layer_idx, attention_mask=attention_mask)
+    after_attention = hidden_states + attention_update
     normalized_mlp = rms_norm(after_attention, weights['post_attention_layernorm.weight'], eps)
     update = mlp(normalized_mlp, weights['mlp.gate_proj.weight'],
                  weights['mlp.up_proj.weight'], weights['mlp.down_proj.weight'])
     return after_attention + update
+
+
 
 def _validate_forward_config(config) -> int:
     """Reject architectures or options that this Qwen2 implementation cannot execute."""
@@ -276,45 +272,22 @@ def _forward_positions(input_ids: torch.Tensor, position_ids, max_positions: int
     return position_ids
 
 
-def forward(
-    input_ids: torch.Tensor,
-    weights: Mapping[str, torch.Tensor],
-    config,
-    *,
-    position_ids: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Return all vocabulary logits for an uncached, unpadded Qwen2 sequence.
 
-    weights uses complete checkpoint keys such as model.embed_tokens.weight.
-    config supplies Qwen2 dimensions and options; no Hugging Face forward is
-    called. Returns [batch, tokens, vocabulary_size], without mutating inputs.
-    Call under torch.inference_mode() during generation.
+def prepare_model(weights, config):
+    """Bind checkpoint tensors and settings once for repeated forward calls."""
+    from .runtime import prepare_model as prepare
+
+    return prepare(weights, config)
+
+
+def forward(input_ids, weights, config=None, *, position_ids=None, cache=None, logits_to_keep=0):
+    """Run inference with raw checkpoint weights or a previously prepared model.
+
+    Raw mappings require config. A prepared model reuses its bound settings.
+    Cache mutation is in place; 0 keeps all new-position logits, N the last N.
     """
-    head_dim = _validate_forward_config(config)
-    if input_ids.ndim != 2 or input_ids.numel() == 0:
-        raise ValueError('input_ids must be a nonempty [batch, tokens] tensor')
-    embedding_weight = weights['model.embed_tokens.weight']
-    if (input_ids.dtype not in (torch.int32, torch.int64)
-            or input_ids.device != embedding_weight.device):
-        raise ValueError('input_ids must be integer token IDs on the embedding device')
-    expected_shape = (config.vocab_size, config.hidden_size)
-    if embedding_weight.shape != expected_shape:
-        raise ValueError('embedding table shape must match the model configuration')
-    final_norm = weights['model.norm.weight']
-    output_weight = embedding_weight if config.tie_word_embeddings else weights['lm_head.weight']
-    if final_norm.shape != (config.hidden_size,) or output_weight.shape != expected_shape:
-        raise ValueError('final norm and vocabulary projection must match the model configuration')
-    positions = _forward_positions(input_ids, position_ids, config.max_position_embeddings)
-    hidden_states = embed_tokens(input_ids, embedding_weight)
-    cos, sin = rope_cos_sin(positions, head_dim, config.rope_theta, dtype=hidden_states.dtype)
-    for index in range(config.num_hidden_layers):
-        prefix = f'model.layers.{index}.'
-        layer_weights = {name[len(prefix):]: value for name, value in weights.items()
-                         if name.startswith(prefix)}
-        hidden_states = decoder_layer(
-            hidden_states, layer_weights, cos, sin,
-            num_attention_heads=config.num_attention_heads,
-            num_key_value_heads=config.num_key_value_heads, eps=config.rms_norm_eps)
-    normalized = rms_norm(hidden_states, final_norm, config.rms_norm_eps)
-    return F.linear(normalized, output_weight)
+    from .runtime import PreparedModel
 
+    prepared = weights if isinstance(weights, PreparedModel) else prepare_model(weights, config)
+    return prepared.forward(input_ids, position_ids=position_ids, cache=cache,
+                            logits_to_keep=logits_to_keep)
