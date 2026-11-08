@@ -1,4 +1,4 @@
-"""Single-head CUDA decode attention; independent of the introductory exercises."""
+"""CUDA decode attention and single-head references, independent of the exercises."""
 from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
@@ -14,7 +14,8 @@ def _load_extension() -> ModuleType:
     return load(
         name='_micro_vllm_decode_attention',
         sources=[str(source_dir / 'decode_attention.cpp'),
-                 str(source_dir / 'decode_attention.cu')],
+                 str(source_dir / 'decode_attention.cu'),
+                 str(source_dir / 'decode_attention_online.cu')],
         extra_cflags=['-O2'],
         extra_cuda_cflags=['-O2'],
         with_cuda=True,
@@ -34,6 +35,43 @@ def decode_attention(query: torch.Tensor, key: torch.Tensor,
     One fused launch materializes L scores, applies stable softmax in FP32,
     and accumulates values in FP32 on the current stream. Import is lazy; first
     use builds only attention sources. This initial version is a correctness
-    baseline; FP16, GQA, paging, online softmax, and model dispatch come later.
+    baseline; decode_attention_online provides the chunked alternative. FP16,
+    paging, general strides, and model dispatch come later; decode_attention_gqa
+    provides FP32 grouped-query support.
     """
     return _load_extension().decode_attention(query, key, value)
+
+
+def decode_attention_online(query: torch.Tensor, key: torch.Tensor,
+                            value: torch.Tensor) -> torch.Tensor:
+    """Single-head FP32 decode attention with online softmax in 32-token chunks.
+
+    Inputs follow decode_attention's [D], [L,D], [L,D] contract. Scores occupy
+    bounded shared memory instead of an L-element GPU workspace. The kernel
+    tracks maximum m, denominator l, and the normalized weighted output u/l;
+    each new chunk rescales prior contributions before adding its own. Keeping
+    the output normalized reduces overflow risk with large finite V values.
+
+    The required [D] output also stores running output between chunks. FP32
+    operation order can differ from the materialized baseline. This first
+    online implementation is a correctness baseline, not a speed claim.
+    """
+    return _load_extension().decode_attention_online(query, key, value)
+
+
+def decode_attention_gqa(query: torch.Tensor, key: torch.Tensor,
+                         value: torch.Tensor) -> torch.Tensor:
+    """FP32 online decode for Q [1,Hq,1,D] and original K/V [1,Hkv,L,D].
+
+    Returns the same shape as Q. Batch size is 1 and only the newest query is
+    processed. Hq must be divisible by positive Hkv; consecutive groups of
+    Hq/Hkv query heads share each KV head. Each query head gets its own CUDA
+    block and online-softmax state, without repeating K/V in GPU memory.
+
+    Inputs must be contiguous strided CUDA float32 tensors on the same device,
+    without gradients or lazy negative views. All L cache positions must be
+    valid and include the current token; Q/K already have RoPE. L and D must
+    be positive. This checkpoint adds head mapping; FP16, arbitrary strides,
+    and model integration are separate steps.
+    """
+    return _load_extension().decode_attention_gqa(query, key, value)
