@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 from .attention import causal_attention
+from .attention_backend import attention_forward, validate_layer_attention
 from .kv_cache import ContiguousKVCache
 
 
@@ -165,7 +166,7 @@ def mlp(
 
 def _layer_attention(
     normalized, weights, cos, sin, *, num_attention_heads,
-    num_key_value_heads, cache, layer_idx, attention_mask,
+    num_key_value_heads, cache, layer_idx, attention_mask, attention_backend='torch',
 ):
     """Compute this layer's attention, appending only newly computed rotated K/V."""
     past = 0
@@ -180,11 +181,15 @@ def _layer_attention(
             or attention_mask.device != normalized.device
             or attention_mask.shape != (tokens, past + tokens)):
         raise ValueError('attention_mask must be a boolean [new_tokens, total_tokens] tensor')
+    head_dim = normalized.shape[-1] // num_attention_heads
+    validate_layer_attention(
+        attention_backend, device=normalized.device, dtype=normalized.dtype,
+        batch_size=normalized.shape[0], query_length=tokens, head_dim=head_dim,
+        attention_mask=attention_mask)
     query, key, value = project_qkv(
         normalized, weights['self_attn.q_proj.weight'], weights['self_attn.k_proj.weight'],
         weights['self_attn.v_proj.weight'], weights['self_attn.q_proj.bias'],
         weights['self_attn.k_proj.bias'], weights['self_attn.v_proj.bias'])
-    head_dim = normalized.shape[-1] // num_attention_heads
     query = split_heads(query, num_attention_heads, head_dim)
     key = split_heads(key, num_key_value_heads, head_dim)
     value = split_heads(value, num_key_value_heads, head_dim)
@@ -192,7 +197,8 @@ def _layer_attention(
     if cache is not None:
         cache.append(layer_idx, key, value)
         key, value = cache.read(layer_idx)
-    heads = causal_attention(query, key, value, past_length=past, attention_mask=attention_mask)
+    heads = attention_forward(query, key, value, past_length=past,
+                              attention_mask=attention_mask, implementation=attention_backend)
     return attention_output(heads, weights['self_attn.o_proj.weight'])
 
 
@@ -208,6 +214,7 @@ def decoder_layer(
     cache: ContiguousKVCache | None = None,
     layer_idx: int | None = None,
     attention_mask: torch.Tensor | None = None,
+    attention_backend: str = 'torch',
 ) -> torch.Tensor:
     """Run one unpadded Qwen pre-norm layer, optionally extending its KV cache."""
     if num_attention_heads <= 0 or num_key_value_heads <= 0:
@@ -225,7 +232,7 @@ def decoder_layer(
     attention_update = _layer_attention(
         normalized, weights, cos, sin, num_attention_heads=num_attention_heads,
         num_key_value_heads=num_key_value_heads, cache=cache,
-        layer_idx=layer_idx, attention_mask=attention_mask)
+        layer_idx=layer_idx, attention_mask=attention_mask, attention_backend=attention_backend)
     after_attention = hidden_states + attention_update
     normalized_mlp = rms_norm(after_attention, weights['post_attention_layernorm.weight'], eps)
     update = mlp(normalized_mlp, weights['mlp.gate_proj.weight'],
@@ -273,14 +280,15 @@ def _forward_positions(input_ids: torch.Tensor, position_ids, max_positions: int
 
 
 
-def prepare_model(weights, config):
+def prepare_model(weights, config, *, attention_backend='auto'):
     """Bind checkpoint tensors and settings once for repeated forward calls."""
     from .runtime import prepare_model as prepare
 
-    return prepare(weights, config)
+    return prepare(weights, config, attention_backend=attention_backend)
 
 
-def forward(input_ids, weights, config=None, *, position_ids=None, cache=None, logits_to_keep=0):
+def forward(input_ids, weights, config=None, *, position_ids=None, cache=None,
+            logits_to_keep=0, attention_backend=None):
     """Run inference with raw checkpoint weights or a previously prepared model.
 
     Raw mappings require config. A prepared model reuses its bound settings.
@@ -288,6 +296,7 @@ def forward(input_ids, weights, config=None, *, position_ids=None, cache=None, l
     """
     from .runtime import PreparedModel
 
-    prepared = weights if isinstance(weights, PreparedModel) else prepare_model(weights, config)
+    prepared = weights if isinstance(weights, PreparedModel) else prepare_model(
+        weights, config, attention_backend='auto' if attention_backend is None else attention_backend)
     return prepared.forward(input_ids, position_ids=position_ids, cache=cache,
-                            logits_to_keep=logits_to_keep)
+                            logits_to_keep=logits_to_keep, attention_backend=attention_backend)

@@ -13,6 +13,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .kv_cache import ContiguousKVCache
+from .attention_backend import validate_attention_backend
 from .model import forward, prepare_model
 from .reference import parse_args
 
@@ -29,7 +30,7 @@ def _eos_ids(eos_token_id, vocab_size):
 
 
 def generate_tokens(weights, config, tokenizer, prompt, max_new_tokens, *, eos_token_id,
-                    use_cache=True):
+                    use_cache=True, attention_backend='auto'):
     """Format one chat request and return only new token IDs, including generated EOS."""
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError('prompt must contain text')
@@ -38,12 +39,13 @@ def generate_tokens(weights, config, tokenizer, prompt, max_new_tokens, *, eos_t
         add_generation_prompt=True, return_tensors='pt',
     ).to(weights['model.embed_tokens.weight'].device)
     return _greedy_decode(input_ids, weights, config, max_new_tokens,
-                          eos_token_id=eos_token_id, use_cache=use_cache)
+                          eos_token_id=eos_token_id, use_cache=use_cache,
+                          attention_backend=attention_backend)
 
 
 @torch.inference_mode()
 def _greedy_decode(input_ids, weights, config, max_new_tokens, *, eos_token_id,
-                   use_cache=True):
+                   use_cache=True, attention_backend='auto'):
     """Prefill once, then decode single tokens; use_cache=False verifies full prefixes."""
     if type(max_new_tokens) is not int or max_new_tokens <= 0:
         raise ValueError('max_new_tokens must be a positive integer')
@@ -52,7 +54,8 @@ def _greedy_decode(input_ids, weights, config, max_new_tokens, *, eos_token_id,
     if input_ids.shape[1] + max_new_tokens - 1 > config.max_position_embeddings:
         raise ValueError('generation would require a forward beyond the configured context length')
     eos_ids = _eos_ids(eos_token_id, config.vocab_size)
-    prepared = prepare_model(weights, config)
+    validate_attention_backend(attention_backend)
+    prepared = prepare_model(weights, config, attention_backend=attention_backend)
     cache = None
     if use_cache:
         embedding = weights['model.embed_tokens.weight']
@@ -76,7 +79,7 @@ def _greedy_decode(input_ids, weights, config, max_new_tokens, *, eos_token_id,
 
 
 def main(argv=None):
-    args = parse_args(argv, description=__doc__)
+    args = parse_args(argv, description=__doc__, with_attention_backend=True)
     if args.device == 'cuda' and not torch.cuda.is_available():
         raise SystemExit('CUDA is unavailable. Check WSL GPU setup or use --device cpu.')
     print(f'Loading {args.model} on {args.device} ...', flush=True)
@@ -89,7 +92,8 @@ def main(argv=None):
     eos = checkpoint.generation_config.eos_token_id
     del checkpoint  # The state dict retains the weight storage; no copy is needed.
     new_tokens = generate_tokens(weights, config, tokenizer, args.prompt,
-                                 args.max_new_tokens, eos_token_id=eos)
+                                 args.max_new_tokens, eos_token_id=eos,
+                                 attention_backend=args.attention_backend)
     print(f'Prompt: {args.prompt}')
     print(f'Generated tokens: {new_tokens.numel()}')
     print(f'Token IDs: {new_tokens.tolist()}')

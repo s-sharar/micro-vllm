@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 from . import model
 from .attention import build_causal_mask
+from .attention_backend import select_attention_backend, validate_attention_backend
 from .kv_cache import ContiguousKVCache
 
 
@@ -70,6 +71,7 @@ class PreparedModel:
     eps: float
     theta: float
     max_position_embeddings: int
+    attention_backend: str = 'auto'
 
     def _past_length(self, input_ids, cache):
         if cache is None:
@@ -97,7 +99,8 @@ class PreparedModel:
         return torch.arange(past, past + input_ids.shape[1], device=input_ids.device).unsqueeze(0)
 
     @torch.inference_mode()
-    def forward(self, input_ids, *, position_ids=None, cache=None, logits_to_keep=0):
+    def forward(self, input_ids, *, position_ids=None, cache=None, logits_to_keep=0,
+                attention_backend=None):
         """Process new tokens, mutate cache if supplied, and return the requested logits.
 
         logits_to_keep=0 returns every new position; positive N returns the last
@@ -112,24 +115,32 @@ class PreparedModel:
         if type(logits_to_keep) is not int or logits_to_keep < 0:
             raise ValueError('logits_to_keep must be a nonnegative integer')
         past = self._past_length(input_ids, cache)
+        policy = self.attention_backend if attention_backend is None else attention_backend
+        implementation = select_attention_backend(
+            policy, device=self.embedding_weight.device, dtype=self.embedding_weight.dtype,
+            batch_size=input_ids.shape[0], query_length=input_ids.shape[1], head_dim=self.head_dim,
+            past_length=past, has_cache=cache is not None)
         positions = self._positions(input_ids, position_ids, cache, past)
         hidden = model.embed_tokens(input_ids, self.embedding_weight)
         cos, sin = model.rope_cos_sin(positions, self.head_dim, self.theta, dtype=hidden.dtype)
-        mask = build_causal_mask(input_ids.shape[1], past + input_ids.shape[1], past, input_ids.device)
+        mask = (build_causal_mask(input_ids.shape[1], past + input_ids.shape[1], past, input_ids.device)
+                if implementation == 'torch' else None)
         for index, layer_weights in enumerate(self.layers):
             hidden = model.decoder_layer(
                 hidden, layer_weights, cos, sin,
                 num_attention_heads=self.num_attention_heads,
                 num_key_value_heads=self.num_key_value_heads, eps=self.eps,
-                cache=cache, layer_idx=index, attention_mask=mask)
+                cache=cache, layer_idx=index, attention_mask=mask,
+                attention_backend=implementation)
         if logits_to_keep:
             hidden = hidden[:, -logits_to_keep:, :]
         normalized = model.rms_norm(hidden, self.final_norm, self.eps)
         return F.linear(normalized, self.output_weight)
 
 
-def prepare_model(weights, config):
+def prepare_model(weights, config, *, attention_backend='auto'):
     """Bind a Qwen2 checkpoint once without copying tensor storage or scanning per token."""
+    validate_attention_backend(attention_backend)
     if not isinstance(weights, Mapping) or config is None:
         raise ValueError('preparation requires a weight mapping and model configuration')
     sizes = (config.num_hidden_layers, config.hidden_size, config.intermediate_size,
@@ -149,4 +160,5 @@ def prepare_model(weights, config):
     layers = _prepared_layers(weights, config, head_dim, embedding)
     return PreparedModel(embedding, layers, final_norm, output,
                          config.num_attention_heads, config.num_key_value_heads, head_dim,
-                         config.rms_norm_eps, config.rope_theta, config.max_position_embeddings)
+                         config.rms_norm_eps, config.rope_theta, config.max_position_embeddings,
+                         attention_backend=attention_backend)
