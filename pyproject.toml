@@ -11,6 +11,10 @@ dependencies = ['torch', 'transformers']
 
 [project.optional-dependencies]
 test = ['coverage']
+cuda = ['ninja>=1.11']
 
 [tool.setuptools.packages.find]
 where = ['src']
+
+[tool.setuptools.package-data]
+micro_vllm = ['csrc/*.cpp', 'csrc/*.cu', 'csrc/*.cuh']
