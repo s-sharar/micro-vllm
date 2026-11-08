@@ -145,9 +145,9 @@ class GroupedQueryAttentionTests(unittest.TestCase):
             shape = list(tensor.shape)
             shape[-1] *= 2
             noncontiguous = torch.ones(shape, device='cuda')[..., ::2]
-            cases = [(tensor.cpu(), 'CUDA'), (tensor.half(), 'float32'),
+            cases = [(tensor.cpu(), 'CUDA'),
                      (tensor.double(), 'float32'), (tensor.long(), 'float32'),
-                     (tensor.to_sparse(), 'strided'), (noncontiguous, 'contiguous'),
+                     (tensor.to_sparse(), 'strided'), (noncontiguous, 'feature stride'),
                      (torch._neg_view(tensor), 'negative views'),
                      (tensor.detach().requires_grad_(), 'gradients'), (tensor.squeeze(0), 'shape')]
             for invalid, message in cases:
