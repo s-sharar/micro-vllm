@@ -14,13 +14,16 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 
-def parse_args(argv=None, *, description=__doc__):
+def parse_args(argv=None, *, description=__doc__, with_attention_backend=False):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct",
                         help="Hugging Face model ID or local checkpoint directory")
     parser.add_argument("--prompt", default="Explain a KV cache in one sentence.")
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    if with_attention_backend:
+        parser.add_argument("--attention-backend", choices=("auto", "torch", "cuda"), default="auto",
+                            help="auto: Flash prefill + native decode; torch: reference; cuda: native decode only")
     args = parser.parse_args(argv)
     if not args.prompt.strip():
         parser.error("--prompt must contain text")

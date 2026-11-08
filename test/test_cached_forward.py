@@ -191,7 +191,8 @@ class CachedForwardTests(unittest.TestCase):
                     dtype=dtype, attn_implementation='eager').to(device).eval()
                 ids = torch.tensor([[10, 20, 30, 40, 50, 60]], device=device)
                 config, weights = reference.config, reference.state_dict()
-                prepared = model.prepare_model(weights, config)
+                # Preserve the tight eager-operation reference; accelerated paths have separate tests.
+                prepared = model.prepare_model(weights, config, attention_backend='torch')
                 cache = cache_for(config, weights, batch_size=1, capacity=6)
                 with torch.inference_mode():
                     expected = reference(input_ids=ids, use_cache=False).logits
