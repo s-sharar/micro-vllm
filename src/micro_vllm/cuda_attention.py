@@ -35,9 +35,9 @@ def decode_attention(query: torch.Tensor, key: torch.Tensor,
     One fused launch materializes L scores, applies stable softmax in FP32,
     and accumulates values in FP32 on the current stream. Import is lazy; first
     use builds only attention sources. This initial version is a correctness
-    baseline; decode_attention_online provides the chunked alternative. FP16,
-    paging, general strides, and model dispatch come later; decode_attention_gqa
-    provides FP32 grouped-query support.
+    baseline; decode_attention_online provides the chunked alternative. The
+    single-head references stay FP32; decode_attention_gqa supports FP16/FP32.
+    GQA accepts outer strides; paging and model dispatch come later.
     """
     return _load_extension().decode_attention(query, key, value)
 
@@ -61,17 +61,21 @@ def decode_attention_online(query: torch.Tensor, key: torch.Tensor,
 
 def decode_attention_gqa(query: torch.Tensor, key: torch.Tensor,
                          value: torch.Tensor) -> torch.Tensor:
-    """FP32 online decode for Q [1,Hq,1,D] and original K/V [1,Hkv,L,D].
+    """Online decode for Q [1,Hq,1,D] and original K/V [1,Hkv,L,D].
 
     Returns the same shape as Q. Batch size is 1 and only the newest query is
     processed. Hq must be divisible by positive Hkv; consecutive groups of
     Hq/Hkv query heads share each KV head. Each query head gets its own CUDA
     block and online-softmax state, without repeating K/V in GPU memory.
 
-    Inputs must be contiguous strided CUDA float32 tensors on the same device,
-    without gradients or lazy negative views. All L cache positions must be
+    Inputs are strided CUDA float32 or float16 tensors with the same dtype and
+    device, without gradients or lazy negative views. Feature stride must be 1;
+    outer strides can be nonnegative, including zero for read-only broadcasts.
+    Q, K, and V use their own head/token strides, so cache-prefix views require
+    no contiguous copies. All L positions must be
     valid and include the current token; Q/K already have RoPE. L and D must
-    be positive. This checkpoint adds head mapping; FP16, arbitrary strides,
-    and model integration are separate steps.
+    be positive. Loads convert to FP32; scores, softmax and the running output
+    stay FP32 across chunks. The final output is cast once to the input dtype.
+    Output is new contiguous storage. Model integration is a separate step.
     """
     return _load_extension().decode_attention_gqa(query, key, value)
