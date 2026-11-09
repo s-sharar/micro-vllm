@@ -14,7 +14,8 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 
-def parse_args(argv=None, *, description=__doc__, with_attention_backend=False):
+def parse_args(argv=None, *, description=__doc__, with_attention_backend=False,
+               with_kv_cache=False):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--model", default="Qwen/Qwen2.5-0.5B-Instruct",
                         help="Hugging Face model ID or local checkpoint directory")
@@ -24,11 +25,18 @@ def parse_args(argv=None, *, description=__doc__, with_attention_backend=False):
     if with_attention_backend:
         parser.add_argument("--attention-backend", choices=("auto", "torch", "cuda"), default="auto",
                             help="auto: Flash prefill + native decode; torch: reference; cuda: native decode only")
+    if with_kv_cache:
+        parser.add_argument("--kv-cache", choices=("contiguous", "paged"),
+                            default="contiguous", help="KV storage for this request")
+        parser.add_argument("--page-size", type=int, default=16,
+                            help="positive tokens per page when using paged KV storage")
     args = parser.parse_args(argv)
     if not args.prompt.strip():
         parser.error("--prompt must contain text")
     if args.max_new_tokens <= 0:
         parser.error("--max-new-tokens must be greater than zero")
+    if with_kv_cache and args.page_size <= 0:
+        parser.error("--page-size must be greater than zero")
     return args
 
 

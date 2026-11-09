@@ -5,8 +5,8 @@ page_size, head_dim] buffers. A fixed logical-to-physical mapping is validated
 on the host once and copied into a private device table. Do not mutate private
 buffers or metadata. Input K already has RoPE; V is its ordinary projection.
 
-gather() allocates a contiguous logical-order copy for debugging/reference
-checks only. Paged attention will read pages directly in a later checkpoint.
+gather() allocates a contiguous logical-order copy for reference attention
+and tests. Native paged decode reads pages directly; initial prefill uses local K/V.
 This class does not allocate/reclaim individual pages dynamically or share
 pages between requests. Reset hides old tokens while retaining all storage.
 Operations use the current stream; callers coordinate cross-stream reuse.
@@ -187,7 +187,7 @@ class PagedKVCache:
 
     @torch.inference_mode()
     def gather(self, layer_idx):
-        """Allocate logical-order K/V copies for tests; this is not paged attention."""
+        """Allocate logical-order K/V copies for reference attention and tests."""
         length = self.length(layer_idx)
         return (self._gather_buffer(self._keys[layer_idx], length),
                 self._gather_buffer(self._values[layer_idx], length))

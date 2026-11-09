@@ -8,6 +8,8 @@ import torch.nn.functional as F
 from .attention import causal_attention
 from .attention_backend import attention_forward, validate_layer_attention
 from .kv_cache import ContiguousKVCache
+from .paged_kv_cache import PagedKVCache
+from .cuda_attention import decode_attention_paged
 
 
 def embed_tokens(input_ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -164,6 +166,22 @@ def mlp(
     gated = F.silu(gate) * up
     return F.linear(gated, down_weight)
 
+
+def _attention_with_cache(query, key, value, *, cache, layer_idx, past,
+                          attention_mask, implementation):
+    """Use local prefill K/V, direct paged decode, or an explicit reference read."""
+    if isinstance(cache, ContiguousKVCache):
+        key, value = cache.read(layer_idx)
+    elif isinstance(cache, PagedKVCache) and past > 0:
+        if implementation == 'cuda' and attention_mask is None:
+            return decode_attention_paged(query, cache, layer_idx=layer_idx)
+        # Reference modes and cached multi-token chunks need logical-order K/V.
+        # Normal CUDA auto/cuda generation never enters this allocating branch.
+        key, value = cache.gather(layer_idx)
+    return attention_forward(query, key, value, past_length=past,
+                             attention_mask=attention_mask, implementation=implementation)
+
+
 def _layer_attention(
     normalized, weights, cos, sin, *, num_attention_heads,
     num_key_value_heads, cache, layer_idx, attention_mask, attention_backend='torch',
@@ -171,7 +189,7 @@ def _layer_attention(
     """Compute this layer's attention, appending only newly computed rotated K/V."""
     past = 0
     if cache is not None:
-        if not isinstance(cache, ContiguousKVCache) or layer_idx is None:
+        if not isinstance(cache, (ContiguousKVCache, PagedKVCache)) or layer_idx is None:
             raise ValueError('cached layers require a cache and layer index')
         past = cache.length(layer_idx)
     tokens = normalized.shape[1]
@@ -196,9 +214,9 @@ def _layer_attention(
     query, key = apply_rope(query, key, cos, sin)
     if cache is not None:
         cache.append(layer_idx, key, value)
-        key, value = cache.read(layer_idx)
-    heads = attention_forward(query, key, value, past_length=past,
-                              attention_mask=attention_mask, implementation=attention_backend)
+    heads = _attention_with_cache(
+        query, key, value, cache=cache, layer_idx=layer_idx, past=past,
+        attention_mask=attention_mask, implementation=attention_backend)
     return attention_output(heads, weights['self_attn.o_proj.weight'])
 
 
@@ -211,7 +229,7 @@ def decoder_layer(
     num_attention_heads: int,
     num_key_value_heads: int,
     eps: float,
-    cache: ContiguousKVCache | None = None,
+    cache: ContiguousKVCache | PagedKVCache | None = None,
     layer_idx: int | None = None,
     attention_mask: torch.Tensor | None = None,
     attention_backend: str = 'torch',
