@@ -1,4 +1,4 @@
-"""Prepared Qwen weights and inference execution over contiguous KV caches.
+"""Prepared Qwen weights and inference execution over contiguous or paged KV caches.
 
 Preparation binds tensor references and snapshots scalar settings once. Do not
 modify those weights during execution. A cache belongs to one request; discard
@@ -15,6 +15,7 @@ from . import model
 from .attention import build_causal_mask
 from .attention_backend import select_attention_backend, validate_attention_backend
 from .kv_cache import ContiguousKVCache
+from .paged_kv_cache import PagedKVCache
 
 
 def _checked_tensor(name, tensor, shape, reference=None):
@@ -76,8 +77,8 @@ class PreparedModel:
     def _past_length(self, input_ids, cache):
         if cache is None:
             return 0
-        if not isinstance(cache, ContiguousKVCache):
-            raise ValueError('cache must be a ContiguousKVCache or None')
+        if not isinstance(cache, (ContiguousKVCache, PagedKVCache)):
+            raise ValueError('cache must be a ContiguousKVCache, PagedKVCache, or None')
         expected = (len(self.layers), input_ids.shape[0], self.num_key_value_heads, self.head_dim)
         actual = (cache.num_layers, cache.batch_size, cache.num_kv_heads, cache.head_dim)
         if actual != expected:
