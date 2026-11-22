@@ -10,7 +10,7 @@ import torch
 
 from micro_vllm import cuda_attention, engine as engine_module, generate, model
 from micro_vllm.engine import Engine, RequestState
-from micro_vllm.kv_pool import KVPoolExhausted, PageState
+from micro_vllm.kv_pool import KVPool, KVPoolExhausted, PageState
 from micro_vllm.paged_kv_cache import PagedKVCache
 from micro_vllm.runtime import PreparedModel
 from test import test_generate as fixtures
@@ -296,6 +296,88 @@ class EngineMixin:
         gc.collect()
         self.assertEqual([ref() for ref in refs], [None] * 3)
         self.assertEqual([engine.result(r).state for r in requests], [CANCELLED, FAILED, COMPLETED])
+
+    @contextlib.contextmanager
+    def flaky_pool_release(self):
+        real, calls = KVPool._release, []
+
+        def release(pool, *args):
+            calls.append(args)
+            if len(calls) == 1:
+                raise RuntimeError('injected release failure')
+            return real(pool, *args)
+        with patch.object(KVPool, '_release', autospec=True, side_effect=release):
+            yield calls
+
+    def owned(self, pool):
+        return [page for page, state in enumerate(self.states(pool)) if state is PageState.OWNED]
+
+    def test_failed_cancel_release_keeps_pages_reachable_for_retry(self):
+        expected = self.expected(budget=2, page_size=3)
+        engine = self.make_engine()
+        running = engine.submit(self.ids('hello world'), 4, None)
+        later = engine.submit(self.ids('hello world'), 2, None)
+        engine.step()
+        with self.flaky_pool_release() as calls:
+            with self.assertRaisesRegex(RuntimeError, 'injected release'):
+                engine.cancel(running)
+            self.assertEqual(engine.result(running).state, CANCELLED)
+            self.assertEqual(len(self.owned(engine.pool)), 2)
+            for _ in range(2):
+                self.assertIs(engine.cancel(running), CANCELLED)
+            self.assertEqual(len(calls), 2)
+        self.settle(engine.pool)
+        self.assertEqual(self.owned(engine.pool), [])
+        drain(engine)
+        self.assertEqual(list(engine.result(later).tokens), expected)
+
+    def test_failed_completion_release_is_retried_by_cancel(self):
+        expected = self.expected(budget=2, page_size=3)
+        engine = self.make_engine()
+        done = engine.submit(self.ids('hello world'), 2, None)
+        later = engine.submit(self.ids('hello world'), 2, None)
+        engine.step()
+        with self.flaky_pool_release() as calls:
+            with self.assertRaisesRegex(RuntimeError, 'injected release'):
+                engine.step()
+            self.assertEqual(engine.result(done).state, COMPLETED)
+            self.assertEqual(list(engine.result(done).tokens), expected)
+            self.assertEqual(len(self.owned(engine.pool)), 2)
+            self.assertIs(engine.cancel(done), COMPLETED)
+            self.assertEqual(len(calls), 2)
+        self.settle(engine.pool)
+        self.assertEqual(self.owned(engine.pool), [])
+        drain(engine)
+        self.assertEqual(list(engine.result(later).tokens), expected)
+
+    def test_failed_result_does_not_retain_engine_or_forward_tensors(self):
+        device, probes = self.weights['model.embed_tokens.weight'].device, []
+
+        def inner():
+            probe = torch.ones(4, device=device)
+            probes.append(weakref.ref(probe))
+            raise ValueError('inner failure')
+
+        def layer(*args, **kwargs):
+            try:
+                inner()
+            except ValueError:
+                raise RuntimeError('outer failure')
+        engine = self.make_engine()
+        engine_ref, pool_ref = weakref.ref(engine), weakref.ref(engine.pool)
+        request = engine.submit(self.ids('hello'), 2, None)
+        with patch('micro_vllm.model.decoder_layer', side_effect=layer):
+            self.assertIsNone(engine.step())
+        result = engine.result(request)
+        del engine
+        gc.collect()
+        self.assertEqual([engine_ref(), pool_ref(), probes[0]()], [None] * 3)
+        self.assertEqual(str(result.error), 'outer failure')
+        self.assertEqual(str(result.error.__context__), 'inner failure')
+        self.assertIsNone(result.error.__traceback__)
+        self.assertIsNone(result.error.__context__.__traceback__)
+        self.assertIn('inner failure', result.error_traceback)
+        self.assertIn('in inner', result.error_traceback)
 
     def test_next_request_reuses_poisoned_pages(self):
         engine = self.make_engine(num_pages=3, page_size=3)

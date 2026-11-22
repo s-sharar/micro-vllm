@@ -11,8 +11,11 @@ once; CUDA pages then retire behind the engine stream before reuse.
 WAITING -> RUNNING -> COMPLETED | CANCELLED | FAILED; waiting requests may be
 cancelled directly. An Exception from a forward, including KVPoolExhausted,
 fails only that request. A BaseException cancels the active request, releases
-its cache and propagates. On CUDA every step and release runs on the stream
-current at construction. Recovery covers host-side exceptions; asynchronous
+its cache and propagates. A release that raises leaves the cache attached;
+cancel() on that terminal request retries it. FAILED results keep the
+exception with tracebacks detached across its chain, plus formatted text, so
+they pin no frames, engine or tensors. On CUDA every step and release runs on
+the stream current at construction. Recovery covers host-side exceptions; asynchronous
 CUDA faults can invalidate the context. Results are kept for the engine's
 lifetime. Single host thread only.
 """
@@ -45,12 +48,27 @@ TERMINAL_STATES = frozenset({RequestState.COMPLETED, RequestState.CANCELLED, Req
 
 @dataclass(frozen=True)
 class RequestResult:
-    """Snapshot of one request; error is set only for FAILED, with frame locals cleared."""
+    """Snapshot of one request; FAILED keeps the exception and its formatted traceback text."""
 
     request_id: int
     state: RequestState
     tokens: tuple[int, ...]
     error: Exception | None = None
+    error_traceback: str | None = None
+
+
+def _detached(error):
+    # Traceback frames would pin the engine, its pool and the failed forward's tensors.
+    pending, seen = [error], set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        current.__traceback__ = None
+        pending.extend((current.__cause__, current.__context__,
+                        *getattr(current, 'exceptions', ())))
+    return error
 
 
 @dataclass
@@ -62,6 +80,7 @@ class _Request:
     state: RequestState = RequestState.WAITING
     tokens: list[int] = field(default_factory=list)
     error: Exception | None = None
+    error_traceback: str | None = None
     cache: PagedKVCache | None = None
     next_input: torch.Tensor | None = None
 
@@ -127,12 +146,16 @@ class Engine:
         """Return a snapshot of the request's state, tokens and error; KeyError if unknown."""
         request = self._requests[request_id]
         return RequestResult(request.request_id, request.state, tuple(request.tokens),
-                             request.error)
+                             request.error, request.error_traceback)
 
     def cancel(self, request_id):
-        """Cancel a waiting or running request; terminal requests keep their state."""
+        """Cancel a waiting or running request; terminal requests keep their state.
+
+        A terminal request whose cache release previously raised retries that release.
+        """
         request = self._requests[request_id]
         if request.state in TERMINAL_STATES:
+            self._release(request)
             return request.state
         if request.state is RequestState.WAITING:
             self._waiting.remove(request)
@@ -153,9 +176,8 @@ class Engine:
                 state = RequestState.COMPLETED if finished else None
                 return request.request_id, token
             except Exception as caught:
-                # A stored traceback would otherwise pin the failed forward's cache and tensors.
-                traceback.clear_frames(caught.__traceback__)
-                state, error = RequestState.FAILED, caught
+                request.error_traceback = ''.join(traceback.format_exception(caught))
+                state, error = RequestState.FAILED, _detached(caught)
                 return None
             finally:
                 if state is not None:
@@ -186,10 +208,13 @@ class Engine:
         return request.tokens[-1], finished
 
     def _finish(self, request, state, error=None):
-        request.state, request.error = state, error
-        cache, request.cache, request.next_input = request.cache, None, None
+        request.state, request.error, request.next_input = state, error, None
         if request is self._active:
             self._active = None
-        if cache is not None:
+        self._release(request)
+
+    def _release(self, request):
+        if request.cache is not None:
             with self._on_stream():
-                cache.release()
+                request.cache.release()
+            request.cache = None
