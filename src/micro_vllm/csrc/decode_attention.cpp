@@ -12,6 +12,9 @@ torch::Tensor decode_attention_gqa_cuda(const torch::Tensor& query,
 torch::Tensor decode_attention_paged_cuda(const torch::Tensor& query,
     const torch::Tensor& key, const torch::Tensor& value,
     const torch::Tensor& table, int64_t length);
+torch::Tensor decode_attention_paged_batch_cuda(const torch::Tensor& query,
+    const torch::Tensor& key, const torch::Tensor& value,
+    const torch::Tensor& table, const torch::Tensor& lengths);
 
 namespace {
 void validate_storage(const torch::Tensor& tensor) {
@@ -99,8 +102,8 @@ void validate_paged_table(const torch::Tensor& table, const torch::Tensor& key,
     TORCH_CHECK(length <= table.size(0) * key.size(2), "context length exceeds page table capacity");
 }
 
-void validate_paged_inputs(const torch::Tensor& query, const torch::Tensor& key,
-                          const torch::Tensor& value, const torch::Tensor& table, int64_t length) {
+void validate_paged_pages(const torch::Tensor& query, const torch::Tensor& key,
+                          const torch::Tensor& value) {
     validate_gqa_tensor(query);
     validate_gqa_tensor(key);
     validate_gqa_tensor(value);
@@ -109,10 +112,9 @@ void validate_paged_inputs(const torch::Tensor& query, const torch::Tensor& key,
     TORCH_CHECK(query.device() == key.device() && key.device() == value.device(),
                 "Q and K/V pages must use the same device");
     TORCH_CHECK(query.dim() == 4 && key.dim() == 4 && value.dim() == 4,
-                "Q must have shape [1,Hq,1,D] and K/V pages shape [P,Hkv,B,D]");
+                "Q must have shape [B,Hq,1,D] and K/V pages shape [P,Hkv,B,D]");
     validate_gqa_strides(query);
     TORCH_CHECK(key.is_contiguous() && value.is_contiguous(), "K/V pages must be contiguous");
-    TORCH_CHECK(query.size(0) == 1, "paged attention requires batch size 1");
     TORCH_CHECK(query.numel() > 0 && key.numel() > 0 && value.numel() > 0,
                 "page dimensions, head counts, and head dimension must be positive");
     TORCH_CHECK(query.size(2) == 1, "paged decode requires exactly one query token");
@@ -120,7 +122,35 @@ void validate_paged_inputs(const torch::Tensor& query, const torch::Tensor& key,
     TORCH_CHECK(query.size(3) == key.size(3), "Q and K/V pages must share the head dimension");
     TORCH_CHECK(query.size(1) % key.size(1) == 0,
                 "query head count must be divisible by KV head count");
+}
+
+void validate_paged_inputs(const torch::Tensor& query, const torch::Tensor& key,
+                          const torch::Tensor& value, const torch::Tensor& table, int64_t length) {
+    validate_paged_pages(query, key, value);
+    TORCH_CHECK(query.size(0) == 1, "paged attention requires batch size 1");
     validate_paged_table(table, key, query, length);
+}
+
+// Row lengths stay on the device; the kernel turns out-of-range lengths into NaN rows.
+void validate_paged_batch_inputs(const torch::Tensor& query, const torch::Tensor& key,
+                                const torch::Tensor& value, const torch::Tensor& table,
+                                const torch::Tensor& lengths) {
+    validate_paged_pages(query, key, value);
+    validate_storage(table);
+    validate_storage(lengths);
+    TORCH_CHECK(table.device() == query.device() && lengths.device() == query.device(),
+                "Q, K/V pages, table and lengths must use the same device");
+    TORCH_CHECK(table.scalar_type() == torch::kInt64 && lengths.scalar_type() == torch::kInt64,
+                "page table and lengths require int64");
+    TORCH_CHECK(table.dim() == 2, "batched page table must be two-dimensional");
+    TORCH_CHECK(lengths.dim() == 1, "lengths must be one-dimensional");
+    TORCH_CHECK(table.is_contiguous() && lengths.is_contiguous(),
+                "page table and lengths must be contiguous");
+    TORCH_CHECK(table.size(0) == query.size(0) && lengths.size(0) == query.size(0),
+                "page table and lengths need one entry for each of the query rows");
+    TORCH_CHECK(table.size(1) > 0, "page table width must be positive");
+    TORCH_CHECK(table.size(1) <= key.size(0), "page table width exceeds physical pages");
+    TORCH_CHECK(query.size(0) <= 65535, "batched paged decode supports at most 65535 rows");
 }
 }  // namespace
 
@@ -151,8 +181,17 @@ torch::Tensor decode_attention_paged(const torch::Tensor& query,
     return decode_attention_paged_cuda(query, key, value, table, length);
 }
 
+torch::Tensor decode_attention_paged_batch(const torch::Tensor& query,
+    const torch::Tensor& key, const torch::Tensor& value,
+    const torch::Tensor& table, const torch::Tensor& lengths) {
+    validate_paged_batch_inputs(query, key, value, table, lengths);
+    return decode_attention_paged_batch_cuda(query, key, value, table, lengths);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def("_decode_attention_paged", &decode_attention_paged, "Internal paged CUDA decode attention");
+    module.def("_decode_attention_paged_batch", &decode_attention_paged_batch,
+               "Internal batched paged CUDA decode attention");
     module.def("decode_attention", &decode_attention, "Single-head CUDA decode attention");
     module.def("decode_attention_online", &decode_attention_online, "Online single-head CUDA decode attention");
     module.def("decode_attention_gqa", &decode_attention_gqa, "FP16/FP32 grouped-query CUDA decode attention");

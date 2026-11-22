@@ -6,17 +6,23 @@ reset or release it after an unexpected execution failure, since layer writes
 are not a whole-forward transaction. Paged forwards reserve all needed pages
 after host preflight and before any layer writes. Explicit positions remain an
 uncached-only API.
+
+forward_batch runs several paged requests from one KVPool in one forward, either
+all full-prompt prefill or all single-token decode (see PagedKVBatch). Unlike
+forward, a failure after its page reservation releases every row in the batch.
 """
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 
 from . import model
 from .attention import build_causal_mask
 from .attention_backend import select_attention_backend, validate_attention_backend
 from .kv_cache import ContiguousKVCache
+from .paged_kv_batch import PagedKVBatch
 from .paged_kv_cache import PagedKVCache
 
 
@@ -140,6 +146,70 @@ class PreparedModel:
         if logits_to_keep:
             hidden = hidden[:, -logits_to_keep:, :]
         normalized = model.rms_norm(hidden, self.final_norm, self.eps)
+        return F.linear(normalized, self.output_weight)
+
+    def _checked_rows(self, input_ids):
+        if (not isinstance(input_ids, Sequence) or isinstance(input_ids, (str, bytes))
+                or not input_ids):
+            raise ValueError('input_ids must be a nonempty sequence of per-row token tensors')
+        for row in input_ids:
+            if (not isinstance(row, torch.Tensor) or row.ndim != 1 or row.numel() == 0
+                    or row.dtype not in (torch.int32, torch.int64)
+                    or row.device != self.embedding_weight.device):
+                raise ValueError('each row must be a nonempty one-dimensional integer token '
+                                 'tensor on the model device')
+        return [row.long() for row in input_ids]
+
+    @torch.inference_mode()
+    def forward_batch(self, input_ids, caches, *, attention_backend=None):
+        """Run one prefill or decode batch of paged requests; return [B, vocab] last-token logits.
+
+        input_ids holds one 1-D token tensor per row on the model device and caches
+        the matching distinct PagedKVCache requests of one KVPool, all bound to the
+        current stream or unbound. Prefill rows start from empty caches with
+        unequal prompt lengths; decode rows add one token each to unequal cached
+        lengths. Each row uses its own page table, RoPE positions and causal
+        boundary; right padding never reaches the cache or valid logits.
+
+        Validation and the single pool reservation precede every write and change
+        nothing when they raise (KVPoolExhausted included). Any later failure
+        releases every row and propagates. Eligible CUDA FP16/FP32 decode issues one
+        batched scatter and one batched attention launch per layer, reading pages
+        directly; auto keeps Flash prefill for one row, and multi-row prefill and the
+        torch backend use reference attention. Row results are not bit-identical to
+        forward() for B > 1 because batched GEMM shapes change rounding.
+        """
+        rows = self._checked_rows(input_ids)
+        batch = PagedKVBatch.prepare(
+            caches, [row.numel() for row in rows], num_layers=len(self.layers),
+            num_kv_heads=self.num_key_value_heads, head_dim=self.head_dim,
+            dtype=self.embedding_weight.dtype, device=self.embedding_weight.device,
+            max_positions=self.max_position_embeddings)
+        policy = self.attention_backend if attention_backend is None else attention_backend
+        implementation = select_attention_backend(
+            policy, device=self.embedding_weight.device, dtype=self.embedding_weight.dtype,
+            batch_size=batch.size, query_length=batch.max_tokens, head_dim=self.head_dim,
+            past_length=batch.starts[0], has_cache=True, paged_batch=True)
+        batch.reserve()
+        try:
+            logits = self._run_batch(rows, batch, implementation)
+            batch.commit()
+        except BaseException as error:
+            batch.abort(error)
+            raise
+        return logits
+
+    def _run_batch(self, rows, batch, implementation):
+        hidden = model.embed_tokens(pad_sequence(rows, batch_first=True), self.embedding_weight)
+        cos, sin = model.rope_cos_sin(batch.positions(), self.head_dim, self.theta,
+                                      dtype=hidden.dtype)
+        for index, layer_weights in enumerate(self.layers):
+            hidden = model.decoder_layer(
+                hidden, layer_weights, cos, sin,
+                num_attention_heads=self.num_attention_heads,
+                num_key_value_heads=self.num_key_value_heads, eps=self.eps,
+                cache=batch, layer_idx=index, attention_backend=implementation)
+        normalized = model.rms_norm(batch.last_hidden(hidden), self.final_norm, self.eps)
         return F.linear(normalized, self.output_weight)
 
 

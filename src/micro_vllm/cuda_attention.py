@@ -83,6 +83,28 @@ def decode_attention_gqa(query: torch.Tensor, key: torch.Tensor,
     return _load_extension().decode_attention_gqa(query, key, value)
 
 
+def _check_paged_query(query, *, rows, head_dim, kv_heads, dtype, device):
+    if not isinstance(query, torch.Tensor):
+        raise ValueError('query must be a tensor')
+    if query.layout != torch.strided or query.is_nested:
+        raise ValueError('query must use dense strided storage')
+    if (query.ndim != 4 or query.shape[0] != rows or query.shape[1] <= 0
+            or query.shape[2] != 1 or query.shape[3] != head_dim):
+        raise ValueError(f'query shape must be [{rows}, query_heads, 1, cache.head_dim]')
+    if query.shape[1] % kv_heads:
+        raise ValueError('query head count must be divisible by KV head count')
+    if dtype not in (torch.float16, torch.float32) or query.dtype != dtype:
+        raise ValueError('query and cache require matching float16 or float32 dtype')
+    if query.requires_grad:
+        raise ValueError('paged decode does not support gradients')
+    if query.is_neg():
+        raise ValueError('paged decode does not support lazy negative views')
+    if query.stride(-1) != 1 or any(stride < 0 for stride in query.stride()[:-1]):
+        raise ValueError('query requires feature stride 1 and nonnegative outer strides')
+    if device.type != 'cuda' or query.device != device:
+        raise ValueError('paged decode requires a CUDA cache and query on the same device')
+
+
 def _checked_paged_query(query, cache, layer_idx):
     from .paged_kv_cache import PagedKVCache
 
@@ -91,25 +113,8 @@ def _checked_paged_query(query, cache, layer_idx):
     length = cache.length(layer_idx)
     if length <= 0:
         raise ValueError('paged decode requires a nonempty cache layer')
-    if not isinstance(query, torch.Tensor):
-        raise ValueError('query must be a tensor')
-    if query.layout != torch.strided or query.is_nested:
-        raise ValueError('query must use dense strided storage')
-    if (query.ndim != 4 or query.shape[0] != 1 or query.shape[1] <= 0
-            or query.shape[2] != 1 or query.shape[3] != cache.head_dim):
-        raise ValueError('query shape must be [1, query_heads, 1, cache.head_dim]')
-    if query.shape[1] % cache.num_kv_heads:
-        raise ValueError('query head count must be divisible by KV head count')
-    if cache.dtype not in (torch.float16, torch.float32) or query.dtype != cache.dtype:
-        raise ValueError('query and cache require matching float16 or float32 dtype')
-    if query.requires_grad:
-        raise ValueError('paged decode does not support gradients')
-    if query.is_neg():
-        raise ValueError('paged decode does not support lazy negative views')
-    if query.stride(-1) != 1 or any(stride < 0 for stride in query.stride()[:-1]):
-        raise ValueError('query requires feature stride 1 and nonnegative outer strides')
-    if cache.device.type != 'cuda' or query.device != cache.device:
-        raise ValueError('paged decode requires a CUDA cache and query on the same device')
+    _check_paged_query(query, rows=1, head_dim=cache.head_dim, kv_heads=cache.num_kv_heads,
+                       dtype=cache.dtype, device=cache.device)
     cache._bind_stream()
     return length
 
@@ -131,8 +136,34 @@ def decode_attention_paged(query: torch.Tensor, cache, *, layer_idx: int) -> tor
     buffers and lengths are unchanged. Output is fresh contiguous storage with
     the query's shape, device and dtype. Runs on the request's bound stream,
     which release() retires behind; other streams are rejected before launch.
+    This is the one-row case of the kernel decode_attention_paged_batch uses.
     """
     length = _checked_paged_query(query, cache, layer_idx)
     return _load_extension()._decode_attention_paged(
         query, cache._keys[layer_idx], cache._values[layer_idx],
         cache._device_page_table, length)
+
+
+@torch.inference_mode()
+def decode_attention_paged_batch(query: torch.Tensor, batch, *, layer_idx: int) -> torch.Tensor:
+    """Attend row b of Q [B,Hq,1,D] over that row's pages in one reserved PagedKVBatch.
+
+    Every row's current token K/V must already be written for this layer. Row b
+    reads only its first ends[b] positions through its own -1-padded table row,
+    using the batch's [B] device lengths; no gather, host table or length readback,
+    or context-sized buffer. One launch covers all rows with the same kernel and
+    reader as decode_attention_paged, so each row's output is bit-identical to a
+    single-request call. Output is fresh contiguous storage with Q's shape.
+    """
+    from .paged_kv_batch import PagedKVBatch
+
+    if not isinstance(batch, PagedKVBatch):
+        raise ValueError('batched paged decode requires a live reserved PagedKVBatch')
+    batch._check_live()
+    pool = batch._pool
+    if type(layer_idx) is not int or not 0 <= layer_idx < pool.num_layers:
+        raise ValueError('layer index must identify an existing cache layer')
+    _check_paged_query(query, rows=batch.size, head_dim=pool.head_dim,
+                       kv_heads=pool.num_kv_heads, dtype=pool.dtype, device=pool.device)
+    return _load_extension()._decode_attention_paged_batch(
+        query, pool._keys[layer_idx], pool._values[layer_idx], batch._table, batch.device_ends)
