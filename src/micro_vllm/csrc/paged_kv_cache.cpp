@@ -6,6 +6,10 @@
 void write_paged_kv_cuda(const torch::Tensor& key, const torch::Tensor& value,
                         const torch::Tensor& key_pages, const torch::Tensor& value_pages,
                         const torch::Tensor& page_table, int64_t start);
+void write_paged_kv_batch_cuda(const torch::Tensor& key, const torch::Tensor& value,
+                              const torch::Tensor& key_pages, const torch::Tensor& value_pages,
+                              const torch::Tensor& page_table, const torch::Tensor& starts,
+                              const torch::Tensor& counts);
 
 namespace {
 void validate_storage(const torch::Tensor& tensor) {
@@ -27,9 +31,8 @@ void validate_data(const torch::Tensor& tensor, const torch::Tensor& key) {
 
 void validate_sources(const torch::Tensor& key, const torch::Tensor& value) {
     TORCH_CHECK(key.dim() == 4 && value.dim() == 4,
-                "K/V must have shape [1,H,N,D]");
+                "K/V must have shape [B,H,N,D]");
     TORCH_CHECK(key.sizes() == value.sizes(), "K/V must have the same shape");
-    TORCH_CHECK(key.size(0) == 1, "K/V shape requires batch size 1");
     TORCH_CHECK(key.numel() > 0, "K/V head, token and feature dimensions must be positive");
     for (const auto& source : {key, value}) {
         TORCH_CHECK(source.stride(3) == 1, "K/V require feature stride 1");
@@ -82,14 +85,35 @@ bool storage_overlaps(const torch::Tensor& left, const torch::Tensor& right) {
         : left_address - right_address < right_storage.nbytes();
 }
 
-void validate_aliases(const torch::Tensor& key, const torch::Tensor& value,
-                      const torch::Tensor& key_pages, const torch::Tensor& value_pages,
-                      const torch::Tensor& page_table) {
+void validate_aliases(const torch::Tensor& key_pages, const torch::Tensor& value_pages,
+                      std::initializer_list<torch::Tensor> sources) {
     TORCH_CHECK(!storage_overlaps(key_pages, value_pages), "K/V pages must not alias storage");
-    for (const auto& source : {key, value, page_table}) {
+    for (const auto& source : sources) {
         TORCH_CHECK(!storage_overlaps(source, key_pages) && !storage_overlaps(source, value_pages),
                     "sources and page table must not alias destination storage");
     }
+}
+
+void validate_row_metadata(const torch::Tensor& metadata, const torch::Tensor& pages,
+                           int64_t rows) {
+    validate_storage(metadata);
+    TORCH_CHECK(metadata.device() == pages.device(), "all tensors must use the same device");
+    TORCH_CHECK(metadata.scalar_type() == torch::kInt64, "row starts and counts must use int64 dtype");
+    TORCH_CHECK(metadata.dim() == 1, "row starts and counts must be one-dimensional");
+    TORCH_CHECK(metadata.is_contiguous(), "row starts and counts must be contiguous");
+    TORCH_CHECK(metadata.size(0) == rows, "row starts and counts need one entry for each of the K/V rows");
+}
+
+// Row starts/counts stay on the device; the kernel skips positions outside a row's table.
+void validate_batch_table(const torch::Tensor& table, const torch::Tensor& pages, int64_t rows) {
+    validate_storage(table);
+    TORCH_CHECK(table.device() == pages.device(), "all tensors must use the same device");
+    TORCH_CHECK(table.scalar_type() == torch::kInt64, "page table must use int64 dtype");
+    TORCH_CHECK(table.dim() == 2, "batched page table must be two-dimensional");
+    TORCH_CHECK(table.is_contiguous(), "page table must be contiguous");
+    TORCH_CHECK(table.size(0) == rows, "page table needs one entry for each of the K/V rows");
+    TORCH_CHECK(table.size(1) > 0, "page table width must be positive");
+    TORCH_CHECK(table.size(1) <= pages.size(0), "page table width cannot exceed physical page count");
 }
 }  // namespace
 
@@ -100,12 +124,30 @@ void write_paged_kv(const torch::Tensor& key, const torch::Tensor& value,
         validate_data(tensor, key);
     }
     validate_sources(key, value);
+    TORCH_CHECK(key.size(0) == 1, "K/V shape requires batch size 1");
     validate_pages(key, key_pages, value_pages);
     validate_table(page_table, key_pages, start, key.size(2));
-    validate_aliases(key, value, key_pages, value_pages, page_table);
+    validate_aliases(key_pages, value_pages, {key, value, page_table});
     write_paged_kv_cuda(key, value, key_pages, value_pages, page_table, start);
+}
+
+void write_paged_kv_batch(const torch::Tensor& key, const torch::Tensor& value,
+                          const torch::Tensor& key_pages, const torch::Tensor& value_pages,
+                          const torch::Tensor& page_table, const torch::Tensor& starts,
+                          const torch::Tensor& counts) {
+    for (const auto& tensor : {key, value, key_pages, value_pages}) {
+        validate_data(tensor, key);
+    }
+    validate_sources(key, value);
+    validate_pages(key, key_pages, value_pages);
+    validate_batch_table(page_table, key_pages, key.size(0));
+    validate_row_metadata(starts, key_pages, key.size(0));
+    validate_row_metadata(counts, key_pages, key.size(0));
+    validate_aliases(key_pages, value_pages, {key, value, page_table, starts, counts});
+    write_paged_kv_batch_cuda(key, value, key_pages, value_pages, page_table, starts, counts);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def("write_paged_kv", &write_paged_kv, "Private paged K/V CUDA writes");
+    module.def("write_paged_kv_batch", &write_paged_kv_batch, "Private batched paged K/V CUDA writes");
 }

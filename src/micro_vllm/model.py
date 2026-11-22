@@ -8,8 +8,9 @@ import torch.nn.functional as F
 from .attention import causal_attention
 from .attention_backend import attention_forward, validate_layer_attention
 from .kv_cache import ContiguousKVCache
+from .paged_kv_batch import PagedKVBatch
 from .paged_kv_cache import PagedKVCache
-from .cuda_attention import decode_attention_paged
+from .cuda_attention import decode_attention_paged, decode_attention_paged_batch
 
 
 def embed_tokens(input_ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -182,11 +183,46 @@ def _attention_with_cache(query, key, value, *, cache, layer_idx, past,
                              attention_mask=attention_mask, implementation=implementation)
 
 
+def _batch_attention(query, key, value, *, batch, layer_idx, implementation):
+    """Write rows' valid K/V, then attend local prefill K/V or each row's pages."""
+    batch.append(layer_idx, key, value)
+    if batch.is_prefill:
+        if implementation == 'flash':
+            return attention_forward(query, key, value, implementation='flash')
+        return causal_attention(query, key, batch.zero_padding(value))
+    if implementation == 'cuda':
+        return decode_attention_paged_batch(query, batch, layer_idx=layer_idx)
+    key, value = batch.gather(layer_idx)
+    return causal_attention(query, key, value, past_length=key.shape[2] - 1,
+                            row_mask=batch.decode_mask())
+
+
+def _rotated_qkv(normalized, weights, cos, sin, num_attention_heads, num_key_value_heads):
+    head_dim = normalized.shape[-1] // num_attention_heads
+    query, key, value = project_qkv(
+        normalized, weights['self_attn.q_proj.weight'], weights['self_attn.k_proj.weight'],
+        weights['self_attn.v_proj.weight'], weights['self_attn.q_proj.bias'],
+        weights['self_attn.k_proj.bias'], weights['self_attn.v_proj.bias'])
+    query = split_heads(query, num_attention_heads, head_dim)
+    key = split_heads(key, num_key_value_heads, head_dim)
+    value = split_heads(value, num_key_value_heads, head_dim)
+    query, key = apply_rope(query, key, cos, sin)
+    return query, key, value
+
+
 def _layer_attention(
     normalized, weights, cos, sin, *, num_attention_heads,
     num_key_value_heads, cache, layer_idx, attention_mask, attention_backend='torch',
 ):
     """Compute this layer's attention, appending only newly computed rotated K/V."""
+    if isinstance(cache, PagedKVBatch):
+        if attention_mask is not None:
+            raise ValueError('a PagedKVBatch builds its own per-row masks')
+        query, key, value = _rotated_qkv(normalized, weights, cos, sin,
+                                         num_attention_heads, num_key_value_heads)
+        heads = _batch_attention(query, key, value, batch=cache, layer_idx=layer_idx,
+                                 implementation=attention_backend)
+        return attention_output(heads, weights['self_attn.o_proj.weight'])
     past = 0
     if cache is not None:
         if not isinstance(cache, (ContiguousKVCache, PagedKVCache)) or layer_idx is None:
@@ -204,14 +240,8 @@ def _layer_attention(
         attention_backend, device=normalized.device, dtype=normalized.dtype,
         batch_size=normalized.shape[0], query_length=tokens, head_dim=head_dim,
         attention_mask=attention_mask)
-    query, key, value = project_qkv(
-        normalized, weights['self_attn.q_proj.weight'], weights['self_attn.k_proj.weight'],
-        weights['self_attn.v_proj.weight'], weights['self_attn.q_proj.bias'],
-        weights['self_attn.k_proj.bias'], weights['self_attn.v_proj.bias'])
-    query = split_heads(query, num_attention_heads, head_dim)
-    key = split_heads(key, num_key_value_heads, head_dim)
-    value = split_heads(value, num_key_value_heads, head_dim)
-    query, key = apply_rope(query, key, cos, sin)
+    query, key, value = _rotated_qkv(normalized, weights, cos, sin,
+                                     num_attention_heads, num_key_value_heads)
     if cache is not None:
         cache.append(layer_idx, key, value)
     heads = _attention_with_cache(
@@ -229,12 +259,15 @@ def decoder_layer(
     num_attention_heads: int,
     num_key_value_heads: int,
     eps: float,
-    cache: ContiguousKVCache | PagedKVCache | None = None,
+    cache: ContiguousKVCache | PagedKVCache | PagedKVBatch | None = None,
     layer_idx: int | None = None,
     attention_mask: torch.Tensor | None = None,
     attention_backend: str = 'torch',
 ) -> torch.Tensor:
-    """Run one unpadded Qwen pre-norm layer, optionally extending its KV cache."""
+    """Run one Qwen pre-norm layer, optionally extending its KV cache.
+
+    Only a PagedKVBatch accepts right-padded rows; it writes and attends valid tokens only.
+    """
     if num_attention_heads <= 0 or num_key_value_heads <= 0:
         raise ValueError('head counts must be positive')
     if hidden_states.ndim != 3 or hidden_states.shape[-1] % num_attention_heads:

@@ -10,11 +10,13 @@ struct ContiguousKVReader {
     int64_t key_token_stride;
     int64_t value_head_stride;
     int64_t value_token_stride;
+    int64_t context_length;
 
-    __device__ inline void select_head(int64_t head) {
+    __device__ inline void select(int64_t, int64_t head) {
         key += head * key_head_stride;
         value += head * value_head_stride;
     }
+    __device__ inline int64_t length() const { return context_length; }
     __device__ inline scalar_t key_at(int64_t token, int64_t feature) const {
         return key[token * key_token_stride + feature];
     }
@@ -33,9 +35,10 @@ torch::Tensor launch_contiguous(const torch::Tensor& query,
     const ContiguousKVReader<scalar_t> reader{
         key.data_ptr<scalar_t>(), value.data_ptr<scalar_t>(),
         single_head ? 0 : key.stride(1), single_head ? key.stride(0) : key.stride(2),
-        single_head ? 0 : value.stride(1), single_head ? value.stride(0) : value.stride(2)};
-    return launch_online_attention<scalar_t>(query, reader, query_heads, query_heads / kv_heads,
-        single_head ? key.size(0) : key.size(2), single_head ? query.size(0) : query.size(3));
+        single_head ? 0 : value.stride(1), single_head ? value.stride(0) : value.stride(2),
+        single_head ? key.size(0) : key.size(2)};
+    return launch_online_attention<scalar_t>(query, reader, 1, query_heads, query_heads / kv_heads,
+        single_head ? query.size(0) : query.size(3));
 }
 }  // namespace
 

@@ -40,3 +40,22 @@ def _write_paged_kv(key: torch.Tensor, value: torch.Tensor,
     device's current CUDA stream. No attention or page reservation occurs here.
     """
     _load_extension().write_paged_kv(key, value, key_pages, value_pages, page_table, start)
+
+
+def _write_paged_kv_batch(key: torch.Tensor, value: torch.Tensor,
+                          key_pages: torch.Tensor, value_pages: torch.Tensor,
+                          page_table: torch.Tensor, starts: torch.Tensor,
+                          counts: torch.Tensor) -> None:
+    """Copy each row's first counts[b] tokens of padded K/V [B,H,N,D] in one launch.
+
+    PagedKVBatch is the supported caller. page_table is its contiguous [B,W] int64
+    device table built from the rows' published tables and padded with -1; starts
+    and counts are [B] int64 device tensors from host metadata. Row b writes
+    positions starts[b] + t for t < counts[b]; padded tokens are never written.
+    Only metadata is validated here, without reading device values. The kernel
+    skips positions outside a row's table width or with an out-of-range physical
+    ID, so a row cannot write into another row's table entries. The single-request
+    write uses the same kernel with no per-row arrays.
+    """
+    _load_extension().write_paged_kv_batch(key, value, key_pages, value_pages,
+                                           page_table, starts, counts)

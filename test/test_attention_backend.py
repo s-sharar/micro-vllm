@@ -70,6 +70,34 @@ class AttentionPolicyTests(unittest.TestCase):
         with patch('torch.backends.cuda.is_flash_attention_available', return_value=False):
             self.assertEqual(backend.select_attention_backend('auto', **options), 'torch')
 
+    def test_paged_batches_use_native_decode_and_reference_prefill(self):
+        decode = dict(query_length=1, past_length=3, has_cache=True, paged_batch=True)
+        for mode in ('auto', 'cuda'):
+            for dtype in (torch.float16, torch.float32):
+                for batch_size in (1, 2, 7):
+                    with self.subTest(mode=mode, dtype=dtype, batch=batch_size):
+                        self.assertEqual(self.select(mode, dtype=dtype, batch_size=batch_size,
+                                                     **decode), 'cuda')
+                        prefill = self.select(mode, dtype=dtype, batch_size=batch_size,
+                                              has_cache=True, paged_batch=True)
+                        flash = mode == 'auto' and dtype == torch.float16 and batch_size == 1
+                        self.assertEqual(prefill, 'flash' if flash else 'torch')
+        self.assertEqual(self.select('torch', batch_size=3, **decode), 'torch')
+        self.assertEqual(self.select('auto', batch_size=3, dtype=torch.bfloat16, **decode), 'torch')
+        self.assertEqual(self.select('auto', batch_size=3, device=torch.device('cpu'), **decode),
+                         'torch')
+        for changes in (dict(device=torch.device('cpu')), dict(dtype=torch.bfloat16)):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.select('cuda', batch_size=3, **{**decode, **changes})
+        with self.assertRaises(ValueError):
+            self.select('cuda', batch_size=2, query_length=1, past_length=3, has_cache=True)
+        rows = backend.MAX_NATIVE_BATCH_ROWS
+        self.assertEqual(rows, 65535)
+        self.assertEqual(self.select('cuda', batch_size=rows, **decode), 'cuda')
+        self.assertEqual(self.select('auto', batch_size=rows + 1, **decode), 'torch')
+        with self.assertRaisesRegex(ValueError, '65535'):
+            self.select('cuda', batch_size=rows + 1, **decode)
+
 
 class ReferenceDispatchTests(unittest.TestCase):
     def test_explicit_true_blocked_mask_is_respected_for_every_implementation(self):

@@ -3,7 +3,8 @@
 Create through allocate(). The pool owns every layer's [num_pages, kv_heads,
 page_size, head_dim] K/V buffers; page ID p names the same slot range in all
 layers. Requests (PagedKVCache.for_pool) own their page tables and lengths and
-obtain pages only through all-or-nothing reservations. Reservation reclaims
+obtain pages only through all-or-nothing reservations; a batch reserves for all
+of its rows in one such reservation. Reservation reclaims
 completed retirements first, then waits on the oldest retirement events, and
 raises KVPoolExhausted without changing ownership if pages are still short.
 Freed IDs are reused in FIFO order.
@@ -125,6 +126,11 @@ class KVPool:
         return reclaimed
 
     def _reserve(self, owner, count):
+        return self._reserve_many([(owner, count)])[0]
+
+    def _reserve_many(self, requests):
+        """Grant every (owner, count) request, or raise before any ownership changes."""
+        count = sum(needed for _, needed in requests)
         self.reclaim()
         while count > self.num_free and self._retiring:
             retirement = self._retiring.popleft()
@@ -133,10 +139,13 @@ class KVPool:
         if count > self.num_free:
             raise KVPoolExhausted(
                 f'KV pool has {self.num_free} free pages; reservation needs {count}')
-        pages = [self._free.popleft() for _ in range(count)]
-        for page in pages:
-            self._states[page], self._owners[page] = PageState.OWNED, owner
-        return pages
+        grants = []
+        for owner, needed in requests:
+            pages = [self._free.popleft() for _ in range(needed)]
+            for page in pages:
+                self._states[page], self._owners[page] = PageState.OWNED, owner
+            grants.append(pages)
+        return grants
 
     def _claim(self, owner, pages):
         if any(self._states[page] is not PageState.FREE for page in pages):

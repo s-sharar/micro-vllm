@@ -1,10 +1,11 @@
-"""Attention policy: reference, native single-token decode, and Flash prefill."""
+"""Attention policy: reference, native single-token or paged-batch decode, and Flash prefill."""
 import torch
 import torch.nn.functional as F
 
 from .attention import _validate_inputs, causal_attention
 
 ATTENTION_BACKENDS = ('auto', 'torch', 'cuda')
+MAX_NATIVE_BATCH_ROWS = 65535  # CUDA grid y-dimension limit of the batched decode launch.
 
 
 def validate_attention_backend(name):
@@ -42,14 +43,21 @@ def validate_layer_attention(implementation, *, device, dtype, batch_size,
 
 
 def select_attention_backend(name, *, device, dtype, batch_size, query_length,
-                             head_dim, past_length, has_cache):
-    """Resolve policy before cache writes; fallback is based on capabilities only."""
+                             head_dim, past_length, has_cache, paged_batch=False):
+    """Resolve policy before cache writes; fallback is based on capabilities only.
+
+    paged_batch marks PreparedModel.forward_batch rows, whose native decode reads
+    per-row page tables for up to MAX_NATIVE_BATCH_ROWS rows; this is checked
+    here, before any write. Flash prefill stays batch size 1.
+    """
     validate_attention_backend(name)
     device = torch.device(device)
-    native_eligible = (device.type == 'cuda' and batch_size == 1
+    rows_eligible = batch_size == 1 or paged_batch and batch_size <= MAX_NATIVE_BATCH_ROWS
+    native_eligible = (device.type == 'cuda' and rows_eligible
                        and dtype in (torch.float16, torch.float32))
     if name == 'cuda' and not native_eligible:
-        raise ValueError("attention_backend='cuda' requires CUDA batch size 1 and float16 or float32")
+        raise ValueError("attention_backend='cuda' requires CUDA batch size 1 (or at most "
+                         f"{MAX_NATIVE_BATCH_ROWS} paged batch rows) and float16 or float32")
     if name == 'torch' or not native_eligible:
         return 'torch'
     if has_cache and past_length > 0 and query_length == 1:

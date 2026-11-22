@@ -61,6 +61,7 @@ def causal_attention(
     *,
     past_length: int = 0,
     attention_mask: torch.Tensor | None = None,
+    row_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Attend Q [B,Hq,Q,D] to cached K/V [B,Hkv,past_length+Q,D].
 
@@ -70,6 +71,9 @@ def causal_attention(
     then probabilities return to the input dtype before the value product.
     A supplied boolean [Q,K] mask marks blocked positions and can be reused
     across layers; otherwise the causal mask is built once for this call.
+    row_mask instead gives each batch row its own boolean [B,Q,K] blocked
+    positions (paged batches with unequal lengths). Blocked scores become -inf,
+    but zero probabilities still multiply V, so blocked V rows must be finite.
     """
     _validate_inputs(query, key, value, past_length)
     batch_size, query_heads, query_length, head_dim = query.shape
@@ -79,6 +83,14 @@ def causal_attention(
                 or attention_mask.device != query.device
                 or attention_mask.shape != (query_length, key_length)):
             raise ValueError('attention_mask must be a dense boolean [query, key] tensor on the Q device')
+        if row_mask is not None:
+            raise ValueError('pass either attention_mask or row_mask, not both')
+    elif row_mask is not None:
+        if (not isinstance(row_mask, torch.Tensor) or row_mask.layout != torch.strided
+                or row_mask.dtype != torch.bool or row_mask.device != query.device
+                or row_mask.shape != (batch_size, query_length, key_length)):
+            raise ValueError('row_mask must be a dense boolean [batch, query, key] tensor on the Q device')
+        attention_mask = row_mask[:, None, None]
     else:
         attention_mask = build_causal_mask(query_length, key_length, past_length, query.device)
 

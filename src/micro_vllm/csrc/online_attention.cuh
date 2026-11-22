@@ -104,32 +104,45 @@ __device__ inline void initialize_online_state(
     __syncthreads();
 }
 
+template <typename scalar_t>
+__device__ inline void fill_nan(scalar_t* output, int64_t head_dim) {
+    for (int64_t feature = threadIdx.x; feature < head_dim; feature += blockDim.x) {
+        output[feature] = static_cast<scalar_t>(CUDART_NAN_F);
+    }
+}
+
 template <typename scalar_t, typename KVReader>
 __global__ void decode_attention_online_kernel(
-    const scalar_t* query, KVReader reader,
-    float* running_output, scalar_t* output, int64_t length, int64_t head_dim, int64_t query_heads_per_kv_head, int64_t query_head_stride
+    const scalar_t* query, KVReader reader, float* running_output, scalar_t* output,
+    int64_t head_dim, int64_t query_heads_per_kv_head, int64_t query_row_stride,
+    int64_t query_head_stride
 ) {
+    const int64_t row = blockIdx.y;
     const int64_t query_head = blockIdx.x;
     const int64_t kv_head = query_head / query_heads_per_kv_head;
-    query += query_head * query_head_stride;
-    reader.select_head(kv_head);
-    running_output += query_head * head_dim;
-    output += query_head * head_dim;
+    const int64_t output_offset = (row * gridDim.x + query_head) * head_dim;
+    query += row * query_row_stride + query_head * query_head_stride;
+    reader.select(row, kv_head);
+    running_output += output_offset;
+    output += output_offset;
     __shared__ float scratch[kOnlineThreads];
     __shared__ float tile_weights[kTokenTile];
     __shared__ OnlineState state;
     const int thread = threadIdx.x;
     const float scale = rsqrtf(static_cast<float>(head_dim));
+    const int64_t length = reader.length();
+    if (length <= 0) {
+        fill_nan(output, head_dim);
+        return;
+    }
     initialize_online_state(running_output, head_dim, state);
     for (int64_t start = 0; start < length; start += kTokenTile) {
         const int count = length - start < kTokenTile
             ? static_cast<int>(length - start) : kTokenTile;
-        // This condition is block-uniform: all threads inspect the same immutable table.
+        // Block-uniform: every thread reads the same immutable row length and table.
         // The prior tile's barrier has completed before any invalid page can be read.
         if (!reader.valid_range(start, count)) {
-            for (int64_t feature = thread; feature < head_dim; feature += blockDim.x) {
-                output[feature] = static_cast<scalar_t>(CUDART_NAN_F);
-            }
+            fill_nan(output, head_dim);
             return;
         }
         const float tile_maximum = compute_tile_scores(
@@ -144,21 +157,23 @@ __global__ void decode_attention_online_kernel(
     }
 }
 
-// The same launch/state allocation serves both physical KV layouts.
+// One block per (query head, batch row); both physical KV layouts share this launch.
 template <typename scalar_t, typename KVReader>
 torch::Tensor launch_online_attention(
-    const torch::Tensor& query, KVReader reader, int64_t query_heads,
-    int64_t heads_per_kv, int64_t length, int64_t head_dim
+    const torch::Tensor& query, KVReader reader, int64_t rows, int64_t query_heads,
+    int64_t heads_per_kv, int64_t head_dim
 ) {
     const c10::cuda::CUDAGuard device_guard(query.device());
     auto output = torch::empty(query.sizes(), query.options());
     auto running_output = query.scalar_type() == torch::kFloat32
         ? output : torch::empty(query.sizes(), query.options().dtype(torch::kFloat32));
     const auto stream = c10::cuda::getCurrentCUDAStream(query.get_device());
-    const int64_t query_head_stride = query.dim() == 1 ? 0 : query.stride(1);
-    decode_attention_online_kernel<scalar_t><<<query_heads, kOnlineThreads, 0, stream>>>(
+    const bool single_head = query.dim() == 1;
+    const dim3 grid(static_cast<unsigned>(query_heads), static_cast<unsigned>(rows));
+    decode_attention_online_kernel<scalar_t><<<grid, kOnlineThreads, 0, stream>>>(
         query.data_ptr<scalar_t>(), reader, running_output.data_ptr<float>(),
-        output.data_ptr<scalar_t>(), length, head_dim, heads_per_kv, query_head_stride);
+        output.data_ptr<scalar_t>(), head_dim, heads_per_kv,
+        single_head ? 0 : query.stride(0), single_head ? 0 : query.stride(1));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return output;
 }
