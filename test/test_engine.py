@@ -1,4 +1,4 @@
-"""Single-threaded engine lifecycle: FIFO, cancellation, failure, interruption and page reuse."""
+"""Engine lifecycle under continuous batching: FIFO, cancellation, failure, interruption, reuse."""
 import contextlib
 import gc
 import os
@@ -11,6 +11,7 @@ import torch
 from micro_vllm import cuda_attention, engine as engine_module, generate, model
 from micro_vllm.engine import Engine, RequestState
 from micro_vllm.kv_pool import KVPool, KVPoolExhausted, PageState
+from micro_vllm.paged_kv_batch import PagedKVBatch
 from micro_vllm.paged_kv_cache import PagedKVCache
 from micro_vllm.runtime import PreparedModel
 from test import test_generate as fixtures
@@ -33,9 +34,9 @@ def drain(engine, limit=100):
 class EngineMixin:
     backends = ('auto', 'torch')
 
-    def make_engine(self, num_pages=8, page_size=3, attention_backend='auto'):
+    def make_engine(self, num_pages=8, page_size=3, attention_backend='auto', **options):
         return Engine(self.weights, self.config, num_pages=num_pages, page_size=page_size,
-                      attention_backend=attention_backend)
+                      attention_backend=attention_backend, **options)
 
     def ids(self, prompt):
         return self.tokenizer.apply_chat_template(
@@ -67,6 +68,24 @@ class EngineMixin:
                            side_effect=PagedKVCache.release) as release):
             yield caches, release
 
+    @contextlib.contextmanager
+    def pool_releases(self):
+        owners, real = [], KVPool._release
+
+        def release(pool, owner, *args):
+            owners.append(owner)
+            return real(pool, owner, *args)
+        with patch.object(KVPool, '_release', autospec=True, side_effect=release):
+            yield owners
+
+    @contextlib.contextmanager
+    def no_forwards(self):
+        with (patch.object(PreparedModel, 'forward', autospec=True) as forward,
+              patch.object(PreparedModel, 'forward_batch', autospec=True) as batch):
+            yield
+        forward.assert_not_called()
+        batch.assert_not_called()
+
     def failing_layer(self, failing_call, error):
         real_layer, calls = model.decoder_layer, []
 
@@ -79,18 +98,17 @@ class EngineMixin:
 
     def test_idle_step_returns_none_without_forward(self):
         engine = self.make_engine()
-        with patch.object(PreparedModel, 'forward', autospec=True) as forward:
+        with self.no_forwards():
             self.assertIsNone(engine.step())
+            self.assertEqual(engine.step_batch(), [])
             self.assertFalse(engine.has_work)
-        forward.assert_not_called()
         request = engine.submit(self.ids('hello'), 1, None)
         self.assertEqual(drain(engine), [(request, engine.result(request).tokens[0])])
-        with patch.object(PreparedModel, 'forward', autospec=True) as forward:
+        with self.no_forwards():
             self.assertIsNone(engine.step())
-        forward.assert_not_called()
 
-    def test_fifo_runs_one_request_at_a_time_and_reports_states(self):
-        engine = self.make_engine()
+    def test_one_active_request_limit_runs_fifo_and_reports_states(self):
+        engine = self.make_engine(max_active_requests=1)
         prompts = (('hello', 2), ('hello world', 3), ('hello world answer yes', 1))
         requests = [engine.submit(self.ids(prompt), budget, None) for prompt, budget in prompts]
         self.assertEqual([engine.result(request).state for request in requests], [WAITING] * 3)
@@ -146,8 +164,9 @@ class EngineMixin:
         stopped = engine.submit(prompt, 6, stop)
         limited = engine.submit(prompt, 3, None)
         events = drain(engine)
-        self.assertEqual(events, [(stopped, token) for token in full[:cut]]
-                         + [(limited, token) for token in full[:3]])
+        self.assertEqual(events[:2], [(stopped, full[0]), (limited, full[0])])
+        self.assertEqual([token for request, token in events if request == stopped], full[:cut])
+        self.assertEqual([token for request, token in events if request == limited], full[:3])
         self.assertEqual(engine.result(stopped).tokens, tuple(full[:cut]))
         self.assertEqual(engine.result(limited).tokens, tuple(full[:3]))
         self.assertEqual({engine.result(stopped).state, engine.result(limited).state}, {COMPLETED})
@@ -180,7 +199,7 @@ class EngineMixin:
             self.assertIs(engine.cancel(second), CANCELLED)
             self.assertEqual(engine.result(second).tokens, ())
             events = drain(engine)
-        self.assertEqual([request for request, _ in events], [first] * 2 + [third] * 2)
+        self.assertEqual([request for request, _ in events], [first, third] * 2)
         self.assertEqual(len(caches), 2)
         self.assertEqual(release.call_count, 2)
         self.assertEqual(engine.result(second).state, CANCELLED)
@@ -196,7 +215,7 @@ class EngineMixin:
             release.assert_called_once_with(caches[0])
             self.assertEqual(caches[0].page_table, ())
             self.settle(engine.pool)
-            self.assertEqual(self.states(engine.pool), [PageState.FREE] * engine.pool.num_pages)
+            self.assertEqual(self.owned(engine.pool), sorted(caches[1].page_table))
             events = drain(engine)
         self.assertEqual(engine.result(running).tokens, (token,))
         self.assertEqual(engine.result(running).state, CANCELLED)
@@ -204,7 +223,7 @@ class EngineMixin:
         self.assertEqual(release.call_count, 2)
 
     def test_unknown_terminal_and_repeated_cancellation(self):
-        engine = self.make_engine()
+        engine = self.make_engine(max_active_requests=1)
         with self.assertRaises(KeyError):
             engine.cancel(0)
         with self.assertRaises(KeyError):
@@ -230,7 +249,8 @@ class EngineMixin:
         later = engine.submit(self.ids('hello world'), 4, None)
         with self.tracked_caches() as (caches, release):
             events = [engine.step() for _ in range(4)]
-            self.assertIsNone(events[-1])
+            self.assertEqual(events[:3], [(starved, token) for token in partial])
+            self.assertEqual(events[-1], (later, full[0]))
             result = engine.result(starved)
             self.assertEqual(result.state, FAILED)
             self.assertIsInstance(result.error, KVPoolExhausted)
@@ -244,32 +264,33 @@ class EngineMixin:
         self.assertEqual(self.states(engine.pool), [PageState.FREE] * 4)
 
     def test_injected_forward_failure_marks_failed_and_next_request_runs(self):
-        engine = self.make_engine()
+        expected = self.expected(page_size=3)
+        engine = self.make_engine(max_active_requests=1)
         failing = engine.submit(self.ids('hello world'), 4, None)
         later = engine.submit(self.ids('hello world'), 4, None)
         error = RuntimeError('injected layer failure')
-        with (self.tracked_caches() as (caches, release),
+        with (self.tracked_caches() as (caches, _), self.pool_releases() as released,
               self.failing_layer(self.config.num_hidden_layers + 1, error)):
             first = engine.step()
-            self.assertIsNone(engine.step())
+            self.assertEqual(engine.step(), (later, expected[0]))
             self.assertEqual(engine.result(failing).state, FAILED)
             self.assertIs(engine.result(failing).error, error)
             self.assertEqual(engine.result(failing).tokens, (first[1],))
-            release.assert_called_once_with(caches[0])
+            self.assertEqual(released, [caches[0]._owner])
             drain(engine)
-        self.assertEqual(list(engine.result(later).tokens), self.expected(page_size=3))
-        self.assertEqual(release.call_count, 2)
+        self.assertEqual(list(engine.result(later).tokens), expected)
+        self.assertEqual(released, [caches[0]._owner, caches[1]._owner])
 
     def test_interruption_cancels_request_releases_pages_and_propagates(self):
-        engine = self.make_engine()
+        engine = self.make_engine(max_active_requests=1)
         interrupted = engine.submit(self.ids('hello world'), 4, None)
         later = engine.submit(self.ids('hello world'), 4, None)
-        with (self.tracked_caches() as (caches, release),
+        with (self.tracked_caches() as (caches, _), self.pool_releases() as released,
               self.failing_layer(self.config.num_hidden_layers + 1, KeyboardInterrupt())):
             token = engine.step()[1]
             with self.assertRaises(KeyboardInterrupt):
                 engine.step()
-            release.assert_called_once_with(caches[0])
+            self.assertEqual(released, [caches[0]._owner])
         result = engine.result(interrupted)
         self.assertEqual((result.state, result.tokens, result.error), (CANCELLED, (token,), None))
         self.assertIs(engine.cancel(interrupted), CANCELLED)
@@ -280,22 +301,24 @@ class EngineMixin:
         self.assertEqual(list(engine.result(later).tokens), self.expected(page_size=3))
 
     def test_terminal_requests_drop_their_cache(self):
-        engine, refs, real = self.make_engine(), [], PagedKVCache.for_pool
+        refs, real = [], PagedKVCache.for_pool
 
         def create(pool, **kwargs):
             cache = real(pool, **kwargs)
             refs.append(weakref.ref(cache))
             return cache
-        requests = [engine.submit(self.ids('hello world'), 3, None) for _ in range(3)]
+        engine = self.make_engine(num_pages=12, max_active_requests=3)
+        requests = [engine.submit(self.ids('hello world'), 3, None) for _ in range(4)]
         with patch.object(PagedKVCache, 'for_pool', side_effect=create):
-            engine.step()
+            engine.step_batch()
             engine.cancel(requests[0])
             with self.failing_layer(1, RuntimeError('injected')):
-                engine.step()
+                engine.step_batch()
             drain(engine)
         gc.collect()
-        self.assertEqual([ref() for ref in refs], [None] * 3)
-        self.assertEqual([engine.result(r).state for r in requests], [CANCELLED, FAILED, COMPLETED])
+        self.assertEqual([ref() for ref in refs], [None] * 4)
+        self.assertEqual([engine.result(r).state for r in requests],
+                         [CANCELLED, FAILED, FAILED, COMPLETED])
 
     @contextlib.contextmanager
     def flaky_pool_release(self):
@@ -312,22 +335,26 @@ class EngineMixin:
     def owned(self, pool):
         return [page for page, state in enumerate(self.states(pool)) if state is PageState.OWNED]
 
+    def owned_by(self, pool, cache):
+        return [page for page in self.owned(pool) if pool._owners[page] is cache._owner]
+
     def test_failed_cancel_release_keeps_pages_reachable_for_retry(self):
         expected = self.expected(budget=2, page_size=3)
         engine = self.make_engine()
         running = engine.submit(self.ids('hello world'), 4, None)
         later = engine.submit(self.ids('hello world'), 2, None)
-        engine.step()
+        with self.tracked_caches() as (caches, _):
+            engine.step()
         with self.flaky_pool_release() as calls:
             with self.assertRaisesRegex(RuntimeError, 'injected release'):
                 engine.cancel(running)
             self.assertEqual(engine.result(running).state, CANCELLED)
-            self.assertEqual(len(self.owned(engine.pool)), 2)
+            self.assertEqual(len(self.owned_by(engine.pool, caches[0])), 2)
             for _ in range(2):
                 self.assertIs(engine.cancel(running), CANCELLED)
             self.assertEqual(len(calls), 2)
         self.settle(engine.pool)
-        self.assertEqual(self.owned(engine.pool), [])
+        self.assertEqual(self.owned_by(engine.pool, caches[0]), [])
         drain(engine)
         self.assertEqual(list(engine.result(later).tokens), expected)
 
@@ -336,18 +363,22 @@ class EngineMixin:
         engine = self.make_engine()
         done = engine.submit(self.ids('hello world'), 2, None)
         later = engine.submit(self.ids('hello world'), 2, None)
-        engine.step()
+        with self.tracked_caches() as (caches, _):
+            engine.step_batch()
         with self.flaky_pool_release() as calls:
             with self.assertRaisesRegex(RuntimeError, 'injected release'):
-                engine.step()
+                engine.step_batch()
             self.assertEqual(engine.result(done).state, COMPLETED)
             self.assertEqual(list(engine.result(done).tokens), expected)
-            self.assertEqual(len(self.owned(engine.pool)), 2)
+            self.assertEqual(len(self.owned_by(engine.pool, caches[0])), 2)
+            self.assertEqual(self.owned_by(engine.pool, caches[1]), [])
             self.assertIs(engine.cancel(done), COMPLETED)
-            self.assertEqual(len(calls), 2)
+            self.assertEqual(len(calls), 3)
         self.settle(engine.pool)
         self.assertEqual(self.owned(engine.pool), [])
-        drain(engine)
+        self.assertTrue(engine.has_work)
+        self.assertEqual(engine.step_batch(), [(done, expected[1]), (later, expected[1])])
+        self.assertFalse(engine.has_work)
         self.assertEqual(list(engine.result(later).tokens), expected)
 
     def test_failed_result_does_not_retain_engine_or_forward_tensors(self):
@@ -383,14 +414,14 @@ class EngineMixin:
         engine = self.make_engine(num_pages=3, page_size=3)
         expected = self.expected(page_size=3)
         tables = []
-        real_forward = PreparedModel.forward
+        real_forward = PreparedModel.forward_batch
 
-        def capture(prepared, ids, **kwargs):
-            result = real_forward(prepared, ids, **kwargs)
-            tables.append(kwargs['cache'].page_table)
+        def capture(prepared, ids, caches, **kwargs):
+            result = real_forward(prepared, ids, caches, **kwargs)
+            tables.append(caches[0].page_table)
             return result
         first = engine.submit(self.ids('hello world'), 4, None)
-        with patch.object(PreparedModel, 'forward', autospec=True, side_effect=capture):
+        with patch.object(PreparedModel, 'forward_batch', autospec=True, side_effect=capture):
             drain(engine)
             first_pages = tables[-1]
             self.assertEqual(sorted(first_pages), [0, 1, 2])
@@ -490,14 +521,17 @@ class EngineCUDATests(EngineMixin, unittest.TestCase):
     def native_path_checks(self, backend):
         with (patch.object(PagedKVCache, 'gather', autospec=True,
                            side_effect=PagedKVCache.gather) as gather,
-              patch('micro_vllm.model.decode_attention_paged',
-                    wraps=cuda_attention.decode_attention_paged) as native):
+              patch.object(PagedKVBatch, 'gather', autospec=True,
+                           side_effect=PagedKVBatch.gather) as batch_gather,
+              patch('micro_vllm.model.decode_attention_paged_batch',
+                    wraps=cuda_attention.decode_attention_paged_batch) as native):
             def check():
+                gather.assert_not_called()
                 if backend == 'torch':
                     native.assert_not_called()
-                    self.assertGreater(gather.call_count, 0)
+                    self.assertGreater(batch_gather.call_count, 0)
                 else:
-                    gather.assert_not_called()
+                    batch_gather.assert_not_called()
                     self.assertGreater(native.call_count, 0)
             yield check
 
@@ -505,19 +539,19 @@ class EngineCUDATests(EngineMixin, unittest.TestCase):
         stream = torch.cuda.Stream()
         with torch.cuda.stream(stream):
             engine = self.make_engine()
-        seen, real_forward = [], PreparedModel.forward
+        seen, real_forward = [], PreparedModel.forward_batch
 
-        def capture(prepared, ids, **kwargs):
+        def capture(prepared, ids, caches, **kwargs):
             seen.append(torch.cuda.current_stream())
-            return real_forward(prepared, ids, **kwargs)
+            return real_forward(prepared, ids, caches, **kwargs)
         running = engine.submit(self.ids('hello world'), 4, None)
         later = engine.submit(self.ids('hello world'), 4, None)
         with (self.tracked_caches() as (caches, release),
-              patch.object(PreparedModel, 'forward', autospec=True, side_effect=capture)):
+              patch.object(PreparedModel, 'forward_batch', autospec=True, side_effect=capture)):
             engine.step()
             engine.cancel(running)
             drain(engine)
-        self.assertEqual(seen, [stream] * 5)
+        self.assertEqual(seen, [stream] * 4)
         self.assertEqual([cache._stream for cache in caches], [stream, stream])
         self.assertEqual(release.call_count, 2)
         self.assertEqual(list(engine.result(later).tokens), self.expected(page_size=3))
@@ -527,25 +561,33 @@ class EngineCUDATests(EngineMixin, unittest.TestCase):
         engine.submit(self.ids('hello'), 2, None)
         drain(engine)
         self.settle(engine.pool)
-        real_release, real_forward, tables = PagedKVCache.release, PreparedModel.forward, []
+        real_release, real_forward = PagedKVCache.release, PreparedModel.forward_batch
+        real_reserve, tables, reserved = KVPool._reserve_many, [], []
 
         def delayed_release(cache):
             torch.cuda._sleep(400_000_000)
             real_release(cache)
 
-        def capture(prepared, ids, **kwargs):
-            result = real_forward(prepared, ids, **kwargs)
-            tables.append(kwargs['cache'].page_table)
+        def capture(prepared, ids, caches, **kwargs):
+            result = real_forward(prepared, ids, caches, **kwargs)
+            tables.append(caches[0].page_table)
             return result
+
+        def reserve(pool, requests):
+            reserved.append(self.states(pool))
+            return real_reserve(pool, requests)
         first = engine.submit(self.ids('hello world'), 4, None)
         second = engine.submit(self.ids('hello world'), 4, None)
         with (patch.object(PagedKVCache, 'release', autospec=True, side_effect=delayed_release),
-              patch.object(PreparedModel, 'forward', autospec=True, side_effect=capture)):
+              patch.object(PreparedModel, 'forward_batch', autospec=True, side_effect=capture),
+              patch.object(KVPool, '_reserve_many', autospec=True, side_effect=reserve)):
             while engine.result(first).state in (WAITING, RUNNING):
                 engine.step()
+            # The tick that completed first admitted second, whose reservation waited for the retirement.
             self.assertEqual(engine.result(first).state, COMPLETED)
-            self.assertEqual(self.states(engine.pool), [PageState.RETIRING] * 3)
-            first_pages = tables[-1]
+            self.assertEqual(engine.result(second).state, RUNNING)
+            self.assertEqual(reserved[-1], [PageState.RETIRING] * 3)
+            first_pages = tables[-2]
             drain(engine)
         self.assertEqual(tables[-1], first_pages)
         expected = self.expected(page_size=3)

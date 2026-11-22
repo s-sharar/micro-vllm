@@ -102,6 +102,11 @@ class KVPool:
     def num_free(self):
         return len(self._free)
 
+    @property
+    def num_available(self):
+        """Free pages plus Retiring pages that a reservation may wait for."""
+        return len(self._free) + sum(len(retirement.pages) for retirement in self._retiring)
+
     def state(self, page_id):
         if type(page_id) is not int or not 0 <= page_id < self.num_pages:
             raise ValueError('page ID must identify a physical page in this pool')
