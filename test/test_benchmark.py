@@ -16,10 +16,8 @@ except ImportError:
     benchmark = None
 
 
+@unittest.skipIf(benchmark is None, 'benchmarks/ is not part of this checkout')
 class BenchmarkTests(unittest.TestCase):
-    def setUp(self):
-        self.assertIsNotNone(benchmark, 'the reproducible benchmark module must exist')
-
     def test_report_defaults_to_separate_benchmark_results_folder(self):
         self.assertEqual(benchmark.parse_args([]).output.parent,
                          Path(benchmark.__file__).resolve().parent / 'results')

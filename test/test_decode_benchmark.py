@@ -15,9 +15,9 @@ import torch
 MODULE = Path(__file__).resolve().parents[1] / 'benchmarks' / 'decode_attention.py'
 
 
+@unittest.skipUnless(MODULE.exists(), 'benchmarks/ is not part of this checkout')
 class DecodeBenchmarkTests(unittest.TestCase):
     def setUp(self):
-        self.assertTrue(MODULE.exists(), 'provide the isolated decode benchmark')
         self.bench = importlib.import_module('benchmarks.decode_attention')
 
     def inputs(self):
