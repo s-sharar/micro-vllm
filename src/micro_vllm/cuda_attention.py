@@ -122,12 +122,13 @@ def decode_attention_paged(query: torch.Tensor, cache, *, layer_idx: int) -> tor
     the current token, is visible. FP16/FP32 I/O uses the existing FP32 online
     computation, with a paged reader instead of a contiguous reader.
 
-    The immutable fixed mapping is validated by cache allocation; the private
-    device table stays on GPU. No gather, KV repetition, host table readback,
-    or context-sized score buffer occurs. Only cache.length(layer_idx) tokens
-    are read; unused pages/slots are ignored. Query, mapping, buffers and lengths
-    are unchanged. Output is fresh contiguous storage with the query's shape,
-    device and dtype. Cross-stream lifetime/reuse remains caller-coordinated.
+    The pool validates owned page IDs and reserve() publishes them to the
+    request's private device table before writes; published entries do not
+    change while owned. No gather, KV repetition, host table readback, or
+    context-sized score buffer occurs. Only cache.length(layer_idx) tokens are
+    read; unused table entries, pages and slots are ignored. Query, mapping,
+    buffers and lengths are unchanged. Output is fresh contiguous storage with
+    the query's shape, device and dtype. Page reuse waits for release() events.
     """
     length = _checked_paged_query(query, cache, layer_idx)
     return _load_extension()._decode_attention_paged(

@@ -53,7 +53,9 @@ class PagedGenerationTests(unittest.TestCase):
                 cache = kwargs['cache']
                 before = cache.sequence_length
                 result = real_forward(ids, prepared, **kwargs)
-                records.append((ids.shape[1], cache, before, cache.sequence_length))
+                records.append((ids.shape[1], cache, before, cache.sequence_length,
+                                cache.page_table,
+                                [cache.length(i) for i in range(cache.num_layers)]))
                 return result
 
             with self.subTest(page_size=page_size), patch(
@@ -66,19 +68,20 @@ class PagedGenerationTests(unittest.TestCase):
             self.assertEqual(cache.num_pages, (capacity + page_size - 1) // page_size)
             self.assertEqual(cache.capacity, cache.num_pages * page_size)
             self.assertEqual(cache.page_size, page_size)
-            self.assertEqual(cache.page_table, tuple(range(cache.num_pages)))
+            self.assertEqual(records[-1][4], tuple(range(cache.num_pages)))
+            self.assertEqual(cache.page_table, ())
             self.assertEqual(cache.num_layers, self.model.config.num_hidden_layers)
             self.assertEqual(cache.num_kv_heads, self.model.config.num_key_value_heads)
             self.assertEqual(cache.head_dim, self.model.config.hidden_size
                              // self.model.config.num_attention_heads)
             self.assertEqual(cache.dtype, self.weights['model.embed_tokens.weight'].dtype)
             self.assertEqual(cache.device, self.weights['model.embed_tokens.weight'].device)
-            for step, (tokens, seen_cache, before, after) in enumerate(records):
+            for step, (tokens, seen_cache, before, after, _, _) in enumerate(records):
                 self.assertIs(seen_cache, cache)
                 self.assertEqual(tokens, prompt_length if step == 0 else 1)
                 self.assertEqual(before, 0 if step == 0 else prompt_length + step - 1)
                 self.assertEqual(after, prompt_length + step)
-            self.assertTrue(all(cache.length(i) == capacity for i in range(cache.num_layers)))
+            self.assertEqual(records[-1][5], [capacity] * cache.num_layers)
 
     def test_paged_stops_at_first_and_later_eos(self):
         sequence = self.generate(budget=8, page_size=3).tolist()
@@ -86,14 +89,22 @@ class PagedGenerationTests(unittest.TestCase):
         prompt_length = self.tokenizer.apply_chat_template(
             [{'role': 'user', 'content': 'hello world'}], tokenize=True,
             add_generation_prompt=True, return_tensors='pt').shape[1]
+        real_forward = generate.forward
         for eos, count in ((sequence[0], 1), ([sequence[0]], 1), (sequence[2], 3)):
+            lengths = []
+
+            def capture(ids, prepared, **kwargs):
+                result = real_forward(ids, prepared, **kwargs)
+                lengths.append(kwargs['cache'].sequence_length)
+                return result
+
             with self.subTest(eos=eos), patch(
-                    'micro_vllm.generate.forward', wraps=generate.forward) as calls:
+                    'micro_vllm.generate.forward', side_effect=capture) as calls:
                 actual = self.generate(budget=8, eos=eos, page_size=3)
                 self.assertEqual(actual.tolist(), sequence[:count])
                 self.assertEqual(calls.call_count, count)
-                cache = calls.call_args.kwargs['cache']
-                self.assertEqual(cache.sequence_length, prompt_length + count - 1)
+                self.assertEqual(lengths[-1], prompt_length + count - 1)
+                self.assertEqual(calls.call_args.kwargs['cache'].sequence_length, 0)
                 with patch.object(self.model.generation_config, 'eos_token_id', eos):
                     expected = reference.generate_tokens(
                         self.model, self.tokenizer, 'hello world', 8)
