@@ -5,5 +5,5 @@ __pycache__/
 build/
 dist/
 docs/
-benchmarks/
+benchmarks/results/
 CLAUDE.md
