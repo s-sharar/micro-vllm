@@ -8,10 +8,10 @@ completed retirements first, then waits on the oldest retirement events, and
 raises KVPoolExhausted without changing ownership if pages are still short.
 Freed IDs are reused in FIFO order.
 
-CPU release frees pages immediately. CUDA release joins every stream the
-request used into the releasing stream, records one event there, and keeps
-the pages Retiring (plus the request's table and host staging memory alive)
-until that event completes. Single-threaded host use only; no scheduling.
+CPU release frees pages immediately. CUDA release records one event on the
+request's bound stream (or the current stream if it never queued work) and
+keeps the pages Retiring, plus the request's table and host staging memory
+alive, until that event completes. Single-threaded host use only.
 """
 from collections import deque
 from dataclasses import dataclass, field
@@ -146,7 +146,7 @@ class KVPool:
         for page in pages:
             self._states[page], self._owners[page] = PageState.OWNED, owner
 
-    def _release(self, owner, pages, streams, keepalive):
+    def _release(self, owner, pages, stream, keepalive):
         if any(self._states[page] is not PageState.OWNED or self._owners[page] is not owner
                for page in pages):
             raise RuntimeError('released pages must be owned by the releasing request')
@@ -156,12 +156,8 @@ class KVPool:
             self._set_free(pages)
             return
         with torch.cuda.device(self.device):
-            stream = torch.cuda.current_stream()
-            for other in streams:
-                if other != stream:
-                    stream.wait_stream(other)
             event = torch.cuda.Event()
-            event.record(stream)
+            event.record(stream or torch.cuda.current_stream())
         for page in pages:
             self._states[page], self._owners[page] = PageState.RETIRING, None
         self._retiring.append(_Retirement(event, list(pages), keepalive))

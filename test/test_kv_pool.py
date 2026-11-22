@@ -146,6 +146,24 @@ class KVPoolTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'released'):
                 operation()
 
+    def test_failed_publication_returns_new_pages_and_requires_release(self):
+        pool = make_pool()
+        cache = PagedKVCache.for_pool(pool, max_tokens=12).reserve(3)
+        append_all(cache, 3)
+        table = cache._device_page_table.clone()
+        with (patch.object(cache, '_publish', side_effect=RuntimeError('copy failed')),
+              self.assertRaisesRegex(RuntimeError, 'copy failed')):
+            cache.reserve(6)
+        self.assertEqual(cache.page_table, (0,))
+        self.assertTrue(torch.equal(cache._device_page_table, table))
+        self.assertEqual(self.states(pool), [OWNED] + [FREE] * 5)
+        for operation in (lambda: cache.reserve(1), lambda: cache.append(0, *chunk(1, 3))):
+            with self.assertRaisesRegex(ValueError, 'release'):
+                operation()
+        cache.release()
+        cache.release()
+        self.assertEqual(self.states(pool), [FREE] * 6)
+
     def test_invalid_arguments_and_empty_release_leave_pool_unchanged(self):
         pool = make_pool()
         cache = PagedKVCache.for_pool(pool, max_tokens=6)
@@ -167,10 +185,10 @@ class KVPoolTests(unittest.TestCase):
         pool = make_pool()
         cache = PagedKVCache.for_pool(pool, max_tokens=3).reserve(3)
         with self.assertRaisesRegex(RuntimeError, 'own'):
-            pool._release(object(), [0], set(), ())
+            pool._release(object(), [0], None, ())
         cache.release()
         with self.assertRaisesRegex(RuntimeError, 'own'):
-            pool._release(cache._owner, [0], set(), ())
+            pool._release(cache._owner, [0], None, ())
 
     def test_gather_follows_dynamic_non_identity_mapping_and_valid_length(self):
         pool = make_pool()
@@ -288,11 +306,57 @@ class CUDAKVPoolTests(unittest.TestCase):
         self.assertTrue(cache._staging.is_pinned())
         self.assertTrue(torch.equal(staging, cache._staging))
         self.assertEqual(cache._device_page_table.tolist(), [0, 1, 2, 3])
-        for layer in range(2):
-            for actual, expected in zip(cache.gather(layer), reference.gather(layer)):
-                torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+        with torch.cuda.stream(stream):
+            for layer in range(2):
+                for actual, expected in zip(cache.gather(layer), reference.gather(layer)):
+                    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
-    def test_release_waits_for_every_stream_the_request_used(self):
+    def test_request_binds_to_first_stream_and_rejects_others_before_work(self):
+        from micro_vllm.cuda_attention import decode_attention_paged
+
+        pool = make_pool('cuda', dtype=torch.float16, head_dim=64)
+        cache = PagedKVCache.for_pool(pool, max_tokens=9)
+        filler = torch.ones((1, 2, 2, 64), device='cuda', dtype=torch.float16)
+        query = torch.ones((1, 14, 1, 64), device='cuda', dtype=torch.float16)
+        bound, other = torch.cuda.Stream(), torch.cuda.Stream()
+        with torch.cuda.stream(bound):
+            cache.reserve(2)
+            cache.append(0, filler, filler)
+            cache.append(1, filler, filler)
+        operations = (lambda: cache.reserve(1), lambda: cache.append(0, filler, filler),
+                      lambda: cache.gather(0),
+                      lambda: decode_attention_paged(query, cache, layer_idx=0))
+        for stream in (other, torch.cuda.default_stream()):
+            for operation in operations:
+                with self.subTest(stream=stream), torch.cuda.stream(stream):
+                    with self.assertRaisesRegex(ValueError, 'stream'):
+                        operation()
+        self.assertEqual((cache.page_table, cache.sequence_length), ((0,), 2))
+        with torch.cuda.stream(bound):
+            cache.reserve(1)
+            self.assertEqual(decode_attention_paged(query, cache, layer_idx=1).shape, query.shape)
+            cache.gather(0)
+
+    def test_release_records_on_the_bound_stream_after_standalone_decode(self):
+        from micro_vllm.cuda_attention import decode_attention_paged
+
+        pool = make_pool('cuda', dtype=torch.float16, head_dim=64)
+        cache = PagedKVCache.for_pool(pool, max_tokens=6)
+        filler = torch.ones((1, 2, 3, 64), device='cuda', dtype=torch.float16)
+        bound = torch.cuda.Stream()
+        with torch.cuda.stream(bound):
+            cache.reserve(3)
+            cache.append(0, filler, filler)
+            torch.cuda._sleep(self.SLEEP_CYCLES)
+            decode_attention_paged(torch.ones((1, 2, 1, 64), device='cuda',
+                                              dtype=torch.float16), cache, layer_idx=0)
+        cache.release()
+        self.assertEqual(pool.reclaim(), 0)
+        self.assertEqual(pool.state(0), RETIRING)
+        bound.synchronize()
+        self.assertEqual(pool.reclaim(), 1)
+
+    def test_release_from_another_stream_waits_for_the_bound_stream(self):
         pool = make_pool('cuda')
         cache = PagedKVCache.for_pool(pool, max_tokens=6)
         side, releaser = torch.cuda.Stream(), torch.cuda.Stream()
@@ -307,6 +371,20 @@ class CUDAKVPoolTests(unittest.TestCase):
         side.synchronize()
         releaser.synchronize()
         self.assertEqual(pool.reclaim(), 2)
+
+    def test_failed_cuda_publication_retires_new_pages_on_the_bound_stream(self):
+        pool = make_pool('cuda')
+        cache = PagedKVCache.for_pool(pool, max_tokens=12).reserve(3)
+        torch.cuda._sleep(self.SLEEP_CYCLES)
+        with (patch.object(cache, '_publish', side_effect=RuntimeError('copy failed')),
+              self.assertRaises(RuntimeError)):
+            cache.reserve(9)
+        self.assertEqual(self.states(pool), [OWNED] + [RETIRING] * 2 + [FREE] * 3)
+        self.assertEqual(cache.page_table, (0,))
+        cache.release()
+        torch.cuda.synchronize()
+        self.assertEqual(pool.reclaim(), 3)
+        self.assertEqual(self.states(pool), [FREE] * 6)
 
     def test_retirement_keeps_request_table_and_staging_alive(self):
         pool = make_pool('cuda')

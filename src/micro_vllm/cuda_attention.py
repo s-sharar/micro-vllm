@@ -110,6 +110,7 @@ def _checked_paged_query(query, cache, layer_idx):
         raise ValueError('query requires feature stride 1 and nonnegative outer strides')
     if cache.device.type != 'cuda' or query.device != cache.device:
         raise ValueError('paged decode requires a CUDA cache and query on the same device')
+    cache._bind_stream()
     return length
 
 
@@ -128,7 +129,8 @@ def decode_attention_paged(query: torch.Tensor, cache, *, layer_idx: int) -> tor
     context-sized score buffer occurs. Only cache.length(layer_idx) tokens are
     read; unused table entries, pages and slots are ignored. Query, mapping,
     buffers and lengths are unchanged. Output is fresh contiguous storage with
-    the query's shape, device and dtype. Page reuse waits for release() events.
+    the query's shape, device and dtype. Runs on the request's bound stream,
+    which release() retires behind; other streams are rejected before launch.
     """
     length = _checked_paged_query(query, cache, layer_idx)
     return _load_extension()._decode_attention_paged(

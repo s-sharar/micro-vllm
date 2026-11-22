@@ -11,9 +11,12 @@ before that forward's K/V writes. Published entries never change while owned.
 gather() allocates a contiguous logical-order copy for reference attention
 and tests. Native paged decode reads pages directly; initial prefill uses local K/V.
 release() returns pages to the pool once; afterwards the request is empty and
-unusable. Reset hides old tokens while keeping owned pages. A forward uses
-one stream; release joins every stream that reserved pages. Input K already
-has RoPE. Unexpected asynchronous failures require releasing the request.
+unusable. Reset hides old tokens while keeping owned pages. On CUDA the first
+reserve/append/gather/paged decode binds the request to the current stream;
+later device work on any other stream is rejected before it is queued, and
+release retires pages behind that stream. A failed page publication returns
+the new pages and leaves the request usable only for release(). Input K
+already has RoPE. Unexpected asynchronous failures require releasing it.
 """
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -57,8 +60,9 @@ class PagedKVCache:
     _pool: KVPool = field(repr=False)
     _staging: torch.Tensor | None = field(default=None, repr=False)
     _owner: object = field(default_factory=object, repr=False)
-    _streams: set = field(default_factory=set, repr=False)
+    _stream: torch.cuda.Stream | None = field(default=None, repr=False)
     _released: bool = False
+    _failed: bool = False
 
     @classmethod
     def allocate(cls, *, num_layers, num_kv_heads, num_pages, page_size,
@@ -147,10 +151,22 @@ class PagedKVCache:
     def _check_active(self):
         if self._released:
             raise ValueError('paged KV cache was released')
+        if self._failed:
+            raise ValueError('page publication failed; release this paged KV cache')
+
+    def _bind_stream(self):
+        if self.device.type != 'cuda':
+            return
+        current = torch.cuda.current_stream(self.device)
+        if self._stream is None:
+            self._stream = current
+        elif current != self._stream:
+            raise ValueError('paged KV cache work must stay on the request stream')
 
     def _append_end(self, layer_idx, key, value):
         self._check_active()
         self._check_layer(layer_idx)
+        self._bind_stream()
         if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
             raise ValueError('keys and values must be tensors')
         if key.layout != torch.strided or value.layout != torch.strided:
@@ -215,6 +231,7 @@ class PagedKVCache:
     def gather(self, layer_idx):
         """Allocate logical-order K/V copies for reference attention and tests."""
         length = self.length(layer_idx)
+        self._bind_stream()
         return (self._gather_buffer(self._keys[layer_idx], length),
                 self._gather_buffer(self._values[layer_idx], length))
 
@@ -233,13 +250,22 @@ class PagedKVCache:
         end = self.sequence_length + new_tokens
         if end > self.capacity:
             raise ValueError('paged KV cache capacity exceeded')
-        if self.device.type == 'cuda':
-            self._streams.add(torch.cuda.current_stream(self.device))
+        self._bind_stream()
         first = len(self._page_ids)
         count = -(-end // self.page_size) - first
-        if count > 0:
-            self._publish(first, self._pool._reserve(self._owner, count))
+        if count <= 0:
+            return self
+        pages = self._pool._reserve(self._owner, count)
+        try:
+            self._publish(first, pages)
+        except BaseException:
+            self._failed = True
+            self._pool._release(self._owner, pages, self._stream, self._keepalive())
+            raise
         return self
+
+    def _keepalive(self):
+        return (self._device_page_table, self._staging)
 
     def _publish(self, first, pages):
         end = first + len(pages)
@@ -247,7 +273,7 @@ class PagedKVCache:
         if self._staging is None:
             self._device_page_table[first:end] = ids
         else:
-            # Staging slots are written once per request; pending copies never see edits.
+            # Slots are written once; a failed publish ends the request, so copies see no edits.
             self._staging[first:end] = ids
             with torch.cuda.device(self.device):
                 self._device_page_table[first:end].copy_(
@@ -258,7 +284,6 @@ class PagedKVCache:
         """Return owned pages to the pool once; CUDA pages retire until queued work ends."""
         if self._released:
             return
-        self._pool._release(self._owner, self._page_ids, self._streams,
-                            (self._device_page_table, self._staging))
+        self._pool._release(self._owner, self._page_ids, self._stream, self._keepalive())
         self._released, self._page_ids = True, []
         self.reset()
