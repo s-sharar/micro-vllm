@@ -36,6 +36,17 @@ def _eos_ids(eos_token_id, vocab_size):
     return tuple(ids)
 
 
+def select_next_token(logits, *, generated, max_new_tokens, eos_ids):
+    """Greedy-pick the last position; return ([1, 1] token, whether the request is finished).
+
+    generated counts tokens selected before this one; the final token counts toward the budget.
+    """
+    next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    finished = (generated + 1 >= max_new_tokens
+                or bool(eos_ids) and next_token.item() in eos_ids)
+    return next_token, finished
+
+
 def generate_tokens(weights, config, tokenizer, prompt, max_new_tokens, *, eos_token_id,
                     use_cache=True, attention_backend='auto', kv_cache='contiguous', page_size=16,
                     kv_pool=None):
@@ -133,9 +144,10 @@ def _decode_loop(input_ids, prepared, cache, max_new_tokens, eos_ids):
     generated = []
     for step in range(max_new_tokens):
         logits = forward(input_ids, prepared, cache=cache, logits_to_keep=1)
-        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        next_token, finished = select_next_token(
+            logits, generated=step, max_new_tokens=max_new_tokens, eos_ids=eos_ids)
         generated.append(next_token)
-        if step + 1 == max_new_tokens or (eos_ids and next_token.item() in eos_ids):
+        if finished:
             break
         input_ids = next_token if cache is not None else torch.cat((input_ids, next_token), dim=1)
     return torch.cat(generated, dim=1)[0]
