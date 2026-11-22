@@ -1,21 +1,29 @@
-"""Fixed-page KV storage for one request, with checked CPU/CUDA append.
+"""Request-owned paged KV view over a shared KVPool, with checked CPU/CUDA append.
 
-Create through allocate(). Each layer owns [physical_pages, kv_heads,
-page_size, head_dim] buffers. A fixed logical-to-physical mapping is validated
-on the host once and copied into a private device table. Do not mutate private
-buffers or metadata. Input K already has RoPE; V is its ordinary projection.
+Create through for_pool() for dynamic pages or allocate() for a private pool
+with a fixed mapping. Pool layers own [physical_pages, kv_heads, page_size,
+head_dim] buffers; this request owns its logical-to-physical page list, a
+device table preallocated at its maximum page count, and per-layer lengths.
+reserve(new_tokens) obtains every extra page for one forward in a single
+all-or-nothing pool reservation and publishes the IDs on the current stream
+before that forward's K/V writes. Published entries never change while owned.
 
 gather() allocates a contiguous logical-order copy for reference attention
 and tests. Native paged decode reads pages directly; initial prefill uses local K/V.
-This class does not allocate/reclaim individual pages dynamically or share
-pages between requests. Reset hides old tokens while retaining all storage.
-Operations use the current stream; callers coordinate cross-stream reuse.
-Unexpected asynchronous failures require discarding/resetting the cache.
+release() returns pages to the pool once; afterwards the request is empty and
+unusable. Reset hides old tokens while keeping owned pages. On CUDA the first
+reserve/append/gather/paged decode binds the request to the current stream;
+later device work on any other stream is rejected before it is queued, and
+release retires pages behind that stream. A failed page publication returns
+the new pages and leaves the request usable only for release(). Input K
+already has RoPE. Unexpected asynchronous failures require releasing it.
 """
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import torch
+
+from .kv_pool import KVPool
 
 
 def _checked_page_ids(page_table, num_pages):
@@ -42,13 +50,19 @@ def _storage_overlaps(left, right):
 
 @dataclass
 class PagedKVCache:
-    """Fixed single-request mapping; append/reset mutate storage and return self."""
+    """One request's page table and lengths; append/reserve/reset return self."""
 
     _keys: tuple[torch.Tensor, ...] = field(repr=False)
     _values: tuple[torch.Tensor, ...] = field(repr=False)
     _lengths: list[int]
-    _page_ids: tuple[int, ...]
+    _page_ids: list[int]
     _device_page_table: torch.Tensor = field(repr=False)
+    _pool: KVPool = field(repr=False)
+    _staging: torch.Tensor | None = field(default=None, repr=False)
+    _owner: object = field(default_factory=object, repr=False)
+    _stream: torch.cuda.Stream | None = field(default=None, repr=False)
+    _released: bool = False
+    _failed: bool = False
 
     @classmethod
     def allocate(cls, *, num_layers, num_kv_heads, num_pages, page_size,
@@ -56,17 +70,27 @@ class PagedKVCache:
         dimensions = (num_layers, num_kv_heads, num_pages, page_size, head_dim)
         if any(type(size) is not int or size <= 0 for size in dimensions):
             raise ValueError('cache dimensions must be positive integers')
-        if dtype not in (torch.float32, torch.float16, torch.bfloat16):
-            raise ValueError('cache dtype must be float32, float16, or bfloat16')
-        device = torch.device(device)
-        if device.type not in ('cpu', 'cuda'):
-            raise ValueError('paged cache requires a CPU or CUDA device')
         page_ids = _checked_page_ids(page_table, num_pages)
-        table = torch.tensor(page_ids, dtype=torch.int64, device=device)
-        shape = (num_pages, num_kv_heads, page_size, head_dim)
-        keys = tuple(torch.empty(shape, dtype=dtype, device=device) for _ in range(num_layers))
-        values = tuple(torch.empty(shape, dtype=dtype, device=device) for _ in range(num_layers))
-        return cls(keys, values, [0] * num_layers, page_ids, table)
+        pool = KVPool.allocate(num_layers=num_layers, num_kv_heads=num_kv_heads,
+                               num_pages=num_pages, page_size=page_size, head_dim=head_dim,
+                               dtype=dtype, device=device)
+        table = torch.tensor(page_ids, dtype=torch.int64, device=pool.device)
+        cache = cls(pool._keys, pool._values, [0] * num_layers, list(page_ids), table, pool)
+        pool._claim(cache._owner, page_ids)
+        return cache
+
+    @classmethod
+    def for_pool(cls, pool, *, max_tokens):
+        """Start an empty request that may grow to max_tokens within the shared pool."""
+        if not isinstance(pool, KVPool):
+            raise ValueError('pool must be a KVPool')
+        if type(max_tokens) is not int or not 0 < max_tokens <= pool.token_capacity:
+            raise ValueError('max_tokens must be a positive integer within pool token capacity')
+        max_pages = -(-max_tokens // pool.page_size)
+        table = torch.full((max_pages,), -1, dtype=torch.int64, device=pool.device)
+        staging = (torch.empty(max_pages, dtype=torch.int64, pin_memory=True)
+                   if pool.device.type == 'cuda' else None)
+        return cls(pool._keys, pool._values, [0] * pool.num_layers, [], table, pool, staging)
 
     @property
     def num_layers(self):
@@ -94,12 +118,13 @@ class PagedKVCache:
 
     @property
     def page_table(self):
-        """Immutable host mapping; the independently owned device table stays private."""
-        return self._page_ids
+        """Snapshot of owned pages in logical order; the device table stays private."""
+        return tuple(self._page_ids)
 
     @property
     def capacity(self):
-        return len(self._page_ids) * self.page_size
+        """Maximum request tokens; reserve() must own a page before writes reach it."""
+        return self._device_page_table.numel() * self.page_size
 
     @property
     def dtype(self):
@@ -123,8 +148,25 @@ class PagedKVCache:
         self._check_layer(layer_idx)
         return self._lengths[layer_idx]
 
+    def _check_active(self):
+        if self._released:
+            raise ValueError('paged KV cache was released')
+        if self._failed:
+            raise ValueError('page publication failed; release this paged KV cache')
+
+    def _bind_stream(self):
+        if self.device.type != 'cuda':
+            return
+        current = torch.cuda.current_stream(self.device)
+        if self._stream is None:
+            self._stream = current
+        elif current != self._stream:
+            raise ValueError('paged KV cache work must stay on the request stream')
+
     def _append_end(self, layer_idx, key, value):
+        self._check_active()
         self._check_layer(layer_idx)
+        self._bind_stream()
         if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
             raise ValueError('keys and values must be tensors')
         if key.layout != torch.strided or value.layout != torch.strided:
@@ -144,8 +186,8 @@ class PagedKVCache:
                    for target in (self._keys[layer_idx], self._values[layer_idx])):
                 raise ValueError('K/V inputs must not overlap destination page storage')
         end = self._lengths[layer_idx] + key.shape[2]
-        if end > self.capacity:
-            raise ValueError('paged KV cache capacity exceeded')
+        if end > len(self._page_ids) * self.page_size:
+            raise ValueError('paged KV cache capacity exceeded; reserve pages first')
         return end
 
     def _append_cpu(self, layer_idx, key, value, start):
@@ -189,11 +231,59 @@ class PagedKVCache:
     def gather(self, layer_idx):
         """Allocate logical-order K/V copies for reference attention and tests."""
         length = self.length(layer_idx)
+        self._bind_stream()
         return (self._gather_buffer(self._keys[layer_idx], length),
                 self._gather_buffer(self._values[layer_idx], length))
 
     def reset(self):
-        """Clear lengths, preserving physical pages and the fixed mapping."""
+        """Clear lengths, preserving owned pages and their mapping."""
         for layer_idx in range(self.num_layers):
             self._lengths[layer_idx] = 0
         return self
+
+    @torch.inference_mode()
+    def reserve(self, new_tokens):
+        """Own and publish every page the next aligned new_tokens need, or change nothing."""
+        self._check_active()
+        if type(new_tokens) is not int or new_tokens <= 0:
+            raise ValueError('new_tokens must be a positive integer')
+        end = self.sequence_length + new_tokens
+        if end > self.capacity:
+            raise ValueError('paged KV cache capacity exceeded')
+        self._bind_stream()
+        first = len(self._page_ids)
+        count = -(-end // self.page_size) - first
+        if count <= 0:
+            return self
+        pages = self._pool._reserve(self._owner, count)
+        try:
+            self._publish(first, pages)
+        except BaseException:
+            self._failed = True
+            self._pool._release(self._owner, pages, self._stream, self._keepalive())
+            raise
+        return self
+
+    def _keepalive(self):
+        return (self._device_page_table, self._staging)
+
+    def _publish(self, first, pages):
+        end = first + len(pages)
+        ids = torch.tensor(pages, dtype=torch.int64)
+        if self._staging is None:
+            self._device_page_table[first:end] = ids
+        else:
+            # Slots are written once; a failed publish ends the request, so copies see no edits.
+            self._staging[first:end] = ids
+            with torch.cuda.device(self.device):
+                self._device_page_table[first:end].copy_(
+                    self._staging[first:end], non_blocking=True)
+        self._page_ids.extend(pages)
+
+    def release(self):
+        """Return owned pages to the pool once; CUDA pages retire until queued work ends."""
+        if self._released:
+            return
+        self._pool._release(self._owner, self._page_ids, self._stream, self._keepalive())
+        self._released, self._page_ids = True, []
+        self.reset()

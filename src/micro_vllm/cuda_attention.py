@@ -110,6 +110,7 @@ def _checked_paged_query(query, cache, layer_idx):
         raise ValueError('query requires feature stride 1 and nonnegative outer strides')
     if cache.device.type != 'cuda' or query.device != cache.device:
         raise ValueError('paged decode requires a CUDA cache and query on the same device')
+    cache._bind_stream()
     return length
 
 
@@ -122,12 +123,14 @@ def decode_attention_paged(query: torch.Tensor, cache, *, layer_idx: int) -> tor
     the current token, is visible. FP16/FP32 I/O uses the existing FP32 online
     computation, with a paged reader instead of a contiguous reader.
 
-    The immutable fixed mapping is validated by cache allocation; the private
-    device table stays on GPU. No gather, KV repetition, host table readback,
-    or context-sized score buffer occurs. Only cache.length(layer_idx) tokens
-    are read; unused pages/slots are ignored. Query, mapping, buffers and lengths
-    are unchanged. Output is fresh contiguous storage with the query's shape,
-    device and dtype. Cross-stream lifetime/reuse remains caller-coordinated.
+    The pool validates owned page IDs and reserve() publishes them to the
+    request's private device table before writes; published entries do not
+    change while owned. No gather, KV repetition, host table readback, or
+    context-sized score buffer occurs. Only cache.length(layer_idx) tokens are
+    read; unused table entries, pages and slots are ignored. Query, mapping,
+    buffers and lengths are unchanged. Output is fresh contiguous storage with
+    the query's shape, device and dtype. Runs on the request's bound stream,
+    which release() retires behind; other streams are rejected before launch.
     """
     length = _checked_paged_query(query, cache, layer_idx)
     return _load_extension()._decode_attention_paged(

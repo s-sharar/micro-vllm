@@ -1,9 +1,11 @@
 """Prepared Qwen weights and inference execution over contiguous or paged KV caches.
 
 Preparation binds tensor references and snapshots scalar settings once. Do not
-modify those weights during execution. A cache belongs to one request; discard
-or reset it after an unexpected execution failure, since layer writes are not
-a whole-forward transaction. Explicit positions remain an uncached-only API.
+modify those weights during execution. A cache belongs to one request; discard,
+reset or release it after an unexpected execution failure, since layer writes
+are not a whole-forward transaction. Paged forwards reserve all needed pages
+after host preflight and before any layer writes. Explicit positions remain an
+uncached-only API.
 """
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -122,6 +124,8 @@ class PreparedModel:
             batch_size=input_ids.shape[0], query_length=input_ids.shape[1], head_dim=self.head_dim,
             past_length=past, has_cache=cache is not None)
         positions = self._positions(input_ids, position_ids, cache, past)
+        if isinstance(cache, PagedKVCache):
+            cache.reserve(input_ids.shape[1])
         hidden = model.embed_tokens(input_ids, self.embedding_weight)
         cos, sin = model.rope_cos_sin(positions, self.head_dim, self.theta, dtype=hidden.dtype)
         mask = (build_causal_mask(input_ids.shape[1], past + input_ids.shape[1], past, input_ids.device)
